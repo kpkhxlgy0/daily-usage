@@ -535,6 +535,16 @@ test("real two-end filesystem demand uses native notifications, delivers a fresh
     const { createDemandServer } = require("../src/demand-server.cjs");
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "daily-usage-two-end-"));
     const watches = new Map();
+    const calls = [];
+    async function phase(promise, label) {
+        let timer;
+        try {
+            return await Promise.race([promise, new Promise((resolve, reject) => {
+                timer = setTimeout(() => reject(new Error(`Two-end phase timed out: ${label}; recent bridge calls: `
+                    + JSON.stringify(calls.slice(-8)))), 5000);
+            })]);
+        } finally { clearTimeout(timer); }
+    }
     let scans = 0;
     let hang = false;
     let abortedWork = 0;
@@ -556,16 +566,19 @@ test("real two-end filesystem demand uses native notifications, delivers a fresh
     const server = createDemandServer({ codexHome: home, service });
     const store = createRemoteStore();
     t.after(async () => {
-        store.dispose();
-        await server.dispose();
-        for (const watch of watches.values()) watch.close();
-        await fs.rm(home, { recursive: true, force: true });
+        try {
+            await phase(store.dispose(), "store cleanup");
+            await phase(server.dispose(), "runner cleanup");
+        } finally {
+            for (const watch of watches.values()) watch.close();
+            await fs.rm(home, { recursive: true, force: true });
+        }
     });
-    await server.ready;
+    await phase(server.ready, "runner initialization");
     assert.equal(scans, 0);
-    const calls = [];
     const f = pageFixture(t, (env, emit) => {
-        calls.push({ method: env.request.method, params: env.request.params });
+        const call = { method: env.request.method, params: env.request.params };
+        calls.push(call);
         const { method, params } = env.request;
         Promise.resolve().then(async () => {
             if (method === "thread/read") return { thread: { id: ThreadId,
@@ -593,13 +606,16 @@ test("real two-end filesystem demand uses native notifications, delivers a fresh
                 return {};
             }
             throw new Error(`Unexpected method ${method}`);
-        }).then(value => emit(response(env, value)), error => emit({ type: "mcp-response", hostId: env.hostId,
-            message: { id: env.request.id, error: { code: error.code, message: error.message } } }));
+        }).then(value => emit(response(env, value)), error => {
+            call.error = error.code ?? error.message;
+            emit({ type: "mcp-response", hostId: env.hostId,
+                message: { id: env.request.id, error: { code: error.code, message: error.message } } });
+        });
     }, { timeoutMs: 1000 });
     const request = (method, params, limits) => f.transport.request(f.frame, Host, method, params, limits);
     const watch = (directory, options) => f.transport.watch(f.frame, Host, directory, options);
-    const fresh = await store.get({ hostId: Host, threadId: ThreadId }, request, { watch });
-    assert.equal(fresh.status, "ok");
+    const fresh = await phase(store.get({ hostId: Host, threadId: ThreadId }, request, { watch }), "fresh report");
+    assert.equal(fresh.status, "ok", JSON.stringify({ fresh, recentCalls: calls.slice(-8) }));
     assert.equal(fresh.snapshot.revision, 1);
     assert.equal(scans, 1);
     assert.equal(watches.size, 0);
@@ -614,11 +630,15 @@ test("real two-end filesystem demand uses native notifications, delivers a fresh
     const hasCancelled = cancelled();
     const controller = new AbortController();
     const task = store.get({ hostId: Host, threadId: ThreadId }, request, { watch, signal: controller.signal });
-    const rejected = assert.rejects(task, { name: "AbortError" });
-    await hasStarted;
-    controller.abort();
-    await rejected;
-    await hasCancelled;
+    try {
+        await phase(Promise.race([hasStarted, task.then(value => {
+            throw new Error("Remote query completed before runner start: "
+                + JSON.stringify({ value, recentCalls: calls.slice(-8) }));
+        })]), "cancellable query runner start");
+        controller.abort();
+        await phase(assert.rejects(task, { name: "AbortError" }), "viewer cancellation");
+        await phase(hasCancelled, "runner cancellation");
+    } finally { controller.abort(); }
     assert.equal(abortedWork, 1);
     assert.equal(watches.size, 0);
 });

@@ -5,7 +5,10 @@ const nativeFs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { Worker } = require('node:worker_threads');
+const { setTimeout: delay } = require('node:timers/promises');
 const { validateSnapshot, MaxSnapshotBytes, normalizeThreadId } = require('./protocol.cjs');
+
+const SharingRetryMs = 25;
 
 async function ensureDirectory(directory)
 {
@@ -24,7 +27,7 @@ async function readJson(file, maxBytes = MaxSnapshotBytes)
     return JSON.parse(bytes.toString('utf8'));
 }
 
-async function atomicWrite(file, value, active = () => true)
+async function atomicWrite(file, value, active = () => true, signal)
 {
     const directory = path.dirname(file);
     const before = await ensureDirectory(directory);
@@ -32,12 +35,26 @@ async function atomicWrite(file, value, active = () => true)
     try
     {
         await fs.writeFile(temp, JSON.stringify(value), { flag: 'wx', mode: 0o600 });
-        const after = await fs.lstat(directory);
-        if (after.isSymbolicLink() || before.ino !== after.ino || before.dev !== after.dev)
-            throw new Error('data-directory-changed');
-        if (!active()) return;
-        // 最终判定与原子提交不让出事件循环；提交后的取消不撤销已发布文件。
-        nativeFs.renameSync(temp, file);
+        let retried = false;
+        for (;;)
+        {
+            const after = await fs.lstat(directory);
+            if (after.isSymbolicLink() || before.ino !== after.ino || before.dev !== after.dev)
+                throw new Error('data-directory-changed');
+            if (!active()) return;
+            try
+            {
+                // 最终判定与原子提交不让出事件循环；提交后的取消不撤销已发布文件。
+                nativeFs.renameSync(temp, file);
+                break;
+            }
+            catch (error)
+            {
+                if (retried || process.platform !== 'win32' || !['EPERM', 'EBUSY'].includes(error.code)) throw error;
+                retried = true;
+                await delay(SharingRetryMs, undefined, { signal });
+            }
+        }
     }
     finally
     {
@@ -56,6 +73,7 @@ function createService({ codexHome, dataDir, now = Date.now,
     const directory = path.join(codexHome, '.daily-usage');
     const reportFile = path.join(directory, 'summary.json');
     const publisherId = randomUUID();
+    const lifetime = new AbortController();
     const pending = new Set();
     const terminations = new Set();
     let machineId;
@@ -92,6 +110,7 @@ function createService({ codexHome, dataDir, now = Date.now,
     {
         if (current !== job) return;
         current = null;
+        job.controller?.abort();
         state = { ...state, status: state.snapshot ? 'stale' : 'unavailable', progress: null };
         terminate(job);
     }
@@ -115,6 +134,7 @@ function createService({ codexHome, dataDir, now = Date.now,
 
     function start(job)
     {
+        job.controller = new AbortController();
         state = { ...state, status: 'loading', error: null, progress: null };
         try
         {
@@ -139,7 +159,7 @@ function createService({ codexHome, dataDir, now = Date.now,
                         if (!validateSnapshot(snapshot, { now: now() }).ok
                             || Buffer.byteLength(JSON.stringify(snapshot)) > MaxSnapshotBytes)
                             throw new Error('invalid-report');
-                        await atomicWrite(reportFile, snapshot, () => active(job));
+                        await atomicWrite(reportFile, snapshot, () => active(job), job.controller.signal);
                         await complete(job, null, snapshot);
                     }).catch(error => complete(job, error));
                 }
@@ -180,7 +200,7 @@ function createService({ codexHome, dataDir, now = Date.now,
         {
             if (error.code !== 'ENOENT') throw error;
             machineId = randomUUID();
-            await atomicWrite(identityFile, { machineId }, () => !stopped);
+            await atomicWrite(identityFile, { machineId }, () => !stopped, lifetime.signal);
         }
         try
         {
@@ -234,6 +254,7 @@ function createService({ codexHome, dataDir, now = Date.now,
         {
             if (disposal) return disposal;
             stopped = true;
+            lifetime.abort();
             for (const subscriber of [...pending]) subscriber.abort();
             disposal = (async () =>
             {

@@ -4,12 +4,14 @@ const nativeFs = require('node:fs');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { setTimeout: delay } = require('node:timers/promises');
 const { normalizeThreadId } = require('./protocol.cjs');
 const { demandPaths, validateMarker, validateCapabilities, validateResult,
     MaxDemandBytes, MaxResultBytes } = require('./demand-protocol.cjs');
 
 const MaxConcurrentRequests = 8;
 const MaxTrackedRequests = 1024;
+const SharingRetryMs = 25;
 const owns = info => typeof process.getuid !== 'function' || info.uid === process.getuid();
 const sameFile = (one, two) => one.dev === two.dev && one.ino === two.ino;
 
@@ -50,6 +52,7 @@ function createDemandServer({ codexHome, service, now = Date.now })
 {
     const paths = demandPaths(codexHome);
     const publisherId = randomUUID();
+    const lifetime = new AbortController();
     const entries = new Map();
     const reads = new Map();
     const tasks = new Set();
@@ -78,7 +81,7 @@ function createDemandServer({ codexHome, service, now = Date.now })
             throw new Error('demand-directory-changed');
     }
 
-    async function atomicWrite(file, value, valid)
+    async function atomicWrite(file, value, valid, signal = lifetime.signal)
     {
         if (stopped || !valid()) return;
         await checkDirectories();
@@ -86,9 +89,24 @@ function createDemandServer({ codexHome, service, now = Date.now })
         try
         {
             await fs.writeFile(temporary, JSON.stringify(value), { flag: 'wx', mode: 0o600 });
-            await checkDirectories();
-            // 最终判定与原子提交不让出事件循环；提交后的取消不撤销已发布文件。
-            if (!stopped && valid()) nativeFs.renameSync(temporary, file);
+            let retried = false;
+            for (;;)
+            {
+                await checkDirectories();
+                if (stopped || !valid()) return;
+                try
+                {
+                    // 最终判定与原子提交不让出事件循环；提交后的取消不撤销已发布文件。
+                    nativeFs.renameSync(temporary, file);
+                    break;
+                }
+                catch (error)
+                {
+                    if (retried || process.platform !== 'win32' || !['EPERM', 'EBUSY'].includes(error.code)) throw error;
+                    retried = true;
+                    await delay(SharingRetryMs, undefined, { signal });
+                }
+            }
         }
         finally
         {
@@ -102,12 +120,13 @@ function createDemandServer({ codexHome, service, now = Date.now })
             requestId: entry.marker.requestId, publisherId, updatedAt: now(), status, ...extras };
         const valid = () => entries.get(entry.marker.requestId) === entry
             && (status === 'cancelled' ? entry.cancelled : !entry.cancelled);
-        entry.writing = (entry.writing || Promise.resolve()).then(async () =>
+        entry.writing = (entry.writing || Promise.resolve()).catch(() => {}).then(async () =>
         {
             if (!valid() || stopped) return;
             if (!validateResult(value, { requestId: entry.marker.requestId, publisherId, now: now() }).ok
                 || Buffer.byteLength(JSON.stringify(value)) > MaxResultBytes) throw new Error('invalid-demand-result');
-            await atomicWrite(path.join(paths.responses, `${entry.marker.requestId}.json`), value, valid);
+            const signal = status === 'cancelled' ? lifetime.signal : entry.controller?.signal || lifetime.signal;
+            await atomicWrite(path.join(paths.responses, `${entry.marker.requestId}.json`), value, valid, signal);
         });
         track(entry.writing);
         return entry.writing;
@@ -310,6 +329,7 @@ function createDemandServer({ codexHome, service, now = Date.now })
     {
         if (disposal) return disposal;
         stopped = true;
+        lifetime.abort();
         watcher?.close();
         for (const entry of entries.values())
         {

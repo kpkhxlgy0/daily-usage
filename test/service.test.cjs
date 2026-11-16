@@ -225,6 +225,80 @@ test('publication commit cannot yield to cancellation before the summary becomes
     assert.equal(JSON.parse(await fs.readFile(summary, 'utf8')).revision, 1);
 });
 
+for (const code of ['EPERM', 'EBUSY'])
+{
+    test(`summary publication recovers once from a Windows ${code} sharing violation`,
+        { skip: process.platform !== 'win32', timeout: 5000 }, async t =>
+    {
+        const { root, workers, service } = await setup(t);
+        const summary = path.join(root, '.daily-usage/summary.json');
+        const renameSync = nativeFs.renameSync;
+        let locked = true;
+        t.mock.method(nativeFs, 'renameSync', (from, to) =>
+        {
+            if (to === summary && locked)
+            {
+                locked = false;
+                throw Object.assign(new Error('sharing-violation'), { code });
+            }
+            return renameSync(from, to);
+        });
+        const first = await started(service, workers);
+        first.worker.emit('message', { type: 'result', report: body() });
+        assert.equal((await bounded(first.result, 'summary retry')).status, 'ok');
+        assert.equal(JSON.parse(await fs.readFile(summary, 'utf8')).revision, 1);
+        assert.equal((await fs.readdir(path.dirname(summary))).some(name => name.endsWith('.tmp')), false);
+    });
+}
+
+test('last-subscriber cancellation during a sharing backoff prevents another commit attempt',
+    { skip: process.platform !== 'win32', timeout: 5000 }, async t =>
+{
+    const { root, workers, service } = await setup(t);
+    const controller = new AbortController();
+    const summary = path.join(root, '.daily-usage/summary.json');
+    const renameSync = nativeFs.renameSync;
+    let attempts = 0;
+    t.mock.method(nativeFs, 'renameSync', (from, to) =>
+    {
+        if (to !== summary) return renameSync(from, to);
+        attempts++;
+        queueMicrotask(() => controller.abort());
+        throw Object.assign(new Error('sharing-violation'), { code: 'EPERM' });
+    });
+    const first = await started(service, workers, { signal: controller.signal });
+    const rejected = assert.rejects(first.result, { name: 'AbortError' });
+    first.worker.emit('message', { type: 'result', report: body() });
+    await bounded(rejected, 'backoff cancellation');
+    await service.dispose();
+    assert.equal(attempts, 1);
+    await assert.rejects(fs.access(summary), { code: 'ENOENT' });
+    assert.equal((await fs.readdir(path.dirname(summary))).some(name => name.endsWith('.tmp')), false);
+});
+
+for (const code of ['EPERM', 'EIO'])
+{
+    test(`summary ${code} failure is bounded and removes its prepared file`,
+        { skip: code === 'EPERM' && process.platform !== 'win32', timeout: 5000 }, async t =>
+    {
+        const { root, workers, service } = await setup(t);
+        const summary = path.join(root, '.daily-usage/summary.json');
+        const renameSync = nativeFs.renameSync;
+        let attempts = 0;
+        t.mock.method(nativeFs, 'renameSync', (from, to) =>
+        {
+            if (to !== summary) return renameSync(from, to);
+            attempts++;
+            throw Object.assign(new Error('write-failed'), { code });
+        });
+        const first = await started(service, workers);
+        first.worker.emit('message', { type: 'result', report: body() });
+        assert.equal((await bounded(first.result, 'bounded publication failure')).status, 'error');
+        assert.equal(attempts, code === 'EPERM' ? 2 : 1);
+        assert.equal((await fs.readdir(path.dirname(summary))).some(name => name.endsWith('.tmp')), false);
+    });
+}
+
 test('worker failures and unexpected exits resolve an error state and allow retry', async t =>
 {
     const { workers, service } = await setup(t);

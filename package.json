@@ -8,7 +8,7 @@
     "node": ">=22.15"
   },
   "scripts": {
-    "test": "node --test test/*.test.cjs",
+    "test": "node --test --test-timeout=15000 test/*.test.cjs",
     "validate": "node scripts/codexpp.cjs validate-tweak",
     "install:local": "node scripts/codexpp.cjs dev",
     "report": "node scripts/report.cjs"

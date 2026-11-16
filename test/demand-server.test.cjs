@@ -265,6 +265,82 @@ test('response commit cannot yield to disposal before successful publication bec
     assert.equal((await response(paths, marker.requestId)).status, 'ok');
 });
 
+for (const code of ['EPERM', 'EBUSY'])
+{
+    test(`response publication recovers once from a Windows ${code} sharing violation`,
+        { skip: process.platform !== 'win32', timeout: 5000 }, async t =>
+    {
+        const { paths, calls } = await setup(t);
+        const marker = makeMarker(randomUUID(), Date.now());
+        await write(paths, marker);
+        await waitFor(() => Promise.resolve(calls.length));
+        const resultFile = path.join(paths.responses, `${marker.requestId}.json`);
+        const renameSync = nativeFs.renameSync;
+        let locked = true;
+        t.mock.method(nativeFs, 'renameSync', (from, to) =>
+        {
+            if (to === resultFile && locked)
+            {
+                locked = false;
+                throw Object.assign(new Error('sharing-violation'), { code });
+            }
+            return renameSync(from, to);
+        });
+        calls[0].resolve({ status: 'ok', snapshot: report() });
+        const result = await waitFor(() => response(paths, marker.requestId), value => value.status !== 'running');
+        assert.equal(result.status, 'ok');
+        assert.equal((await fs.readdir(paths.responses)).some(name => name.endsWith('.tmp')), false);
+    });
+}
+
+test('runner disposal during a sharing backoff prevents another response commit attempt',
+    { skip: process.platform !== 'win32', timeout: 5000 }, async t =>
+{
+    const { paths, calls, server } = await setup(t);
+    const marker = makeMarker(randomUUID(), Date.now());
+    await write(paths, marker);
+    await waitFor(() => Promise.resolve(calls.length));
+    const resultFile = path.join(paths.responses, `${marker.requestId}.json`);
+    const renameSync = nativeFs.renameSync;
+    let attempts = 0;
+    let disposal;
+    let cancelled;
+    const cancellation = new Promise(resolve => { cancelled = resolve; });
+    t.mock.method(nativeFs, 'renameSync', (from, to) =>
+    {
+        if (to !== resultFile) return renameSync(from, to);
+        attempts++;
+        queueMicrotask(() => { disposal = server.dispose(); cancelled(); });
+        throw Object.assign(new Error('sharing-violation'), { code: 'EPERM' });
+    });
+    calls[0].resolve({ status: 'ok', snapshot: report() });
+    await bounded(cancellation, 'retry cancellation');
+    await bounded(disposal, 'retry disposal');
+    assert.equal(attempts, 1);
+    assert.equal((await response(paths, marker.requestId)).status, 'running');
+    assert.equal((await fs.readdir(paths.responses)).some(name => name.endsWith('.tmp')), false);
+});
+
+test('a failed final publication does not poison the serialized error response', { timeout: 5000 }, async t =>
+{
+    const { paths, calls } = await setup(t);
+    const marker = makeMarker(randomUUID(), Date.now());
+    await write(paths, marker);
+    await waitFor(() => Promise.resolve(calls.length));
+    const resultFile = path.join(paths.responses, `${marker.requestId}.json`);
+    const renameSync = nativeFs.renameSync;
+    t.mock.method(nativeFs, 'renameSync', (from, to) =>
+    {
+        if (to === resultFile && JSON.parse(nativeFs.readFileSync(from, 'utf8')).status === 'ok')
+            throw Object.assign(new Error('write-failed'), { code: 'EIO' });
+        return renameSync(from, to);
+    });
+    calls[0].resolve({ status: 'ok', snapshot: report() });
+    const result = await waitFor(() => response(paths, marker.requestId), value => value.status !== 'running');
+    assert.equal(result.status, 'error');
+    assert.equal(result.error, 'collector-failed');
+});
+
 test('ignores malformed, oversized, expired and foreign markers and bounds concurrent queries', async t =>
 {
     const { paths, calls } = await setup(t);
