@@ -41,6 +41,19 @@ async function started(service, workers, options)
     return { result, worker: workers.at(-1) };
 }
 
+async function bounded(promise, operation)
+{
+    let timer;
+    try
+    {
+        return await Promise.race([promise, new Promise((resolve, reject) =>
+        {
+            timer = setTimeout(() => reject(new Error(`Timed out waiting for ${operation}`)), 2500);
+        })]);
+    }
+    finally { clearTimeout(timer); }
+}
+
 test('startup and idle never create a collector; each query awaits a fresh terminated worker', async t =>
 {
     const { root, workers, service } = await setup(t);
@@ -140,7 +153,8 @@ test('pre-aborted queries do not create workers', async t =>
     assert.equal(workers.length, 0);
 });
 
-test('cancellation during asynchronous publication preparation leaves no summary or temporary file', async t =>
+test('cancellation during asynchronous publication preparation leaves no summary or temporary file',
+    { timeout: 5000 }, async t =>
 {
     const { root, workers, service } = await setup(t);
     const controller = new AbortController();
@@ -163,7 +177,7 @@ test('cancellation during asynchronous publication preparation leaves no summary
     first.worker.emit('message', { type: 'result', report: body() });
     try
     {
-        await preparing;
+        await bounded(preparing, 'summary preparation');
         const rejected = assert.rejects(first.result, { name: 'AbortError' });
         controller.abort();
         await rejected;
@@ -175,7 +189,7 @@ test('cancellation during asynchronous publication preparation leaves no summary
     assert.equal(names.some(name => name.startsWith('.summary.json.')), false);
 });
 
-test('publication commit cannot yield to cancellation before the summary becomes visible', async t =>
+test('publication commit cannot yield to cancellation before the summary becomes visible', { timeout: 5000 }, async t =>
 {
     const { root, workers, service } = await setup(t);
     const controller = new AbortController();
@@ -205,7 +219,7 @@ test('publication commit cannot yield to cancellation before the summary becomes
         events.push('committed');
     });
     first.worker.emit('message', { type: 'result', report: body() });
-    await first.result.catch(error => assert.equal(error.name, 'AbortError'));
+    await bounded(first.result.catch(error => assert.equal(error.name, 'AbortError')), 'summary commit');
     await service.dispose();
     assert.deepEqual(events, ['committed', 'cancelled']);
     assert.equal(JSON.parse(await fs.readFile(summary, 'utf8')).revision, 1);

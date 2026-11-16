@@ -48,9 +48,20 @@ async function setup(t, options = {})
 
 async function write(paths, marker)
 {
-    const temporary = path.join(paths.requests, `.${randomUUID()}.tmp`);
-    await fs.writeFile(temporary, JSON.stringify(marker));
-    await fs.rename(temporary, path.join(paths.requests, `${marker.requestId}.json`));
+    await fs.writeFile(path.join(paths.requests, `${marker.requestId}.json`), JSON.stringify(marker));
+}
+
+async function bounded(promise, operation)
+{
+    let timer;
+    try
+    {
+        return await Promise.race([promise, new Promise((resolve, reject) =>
+        {
+            timer = setTimeout(() => reject(new Error(`Timed out waiting for ${operation}`)), 2500);
+        })]);
+    }
+    finally { clearTimeout(timer); }
 }
 
 async function waitFor(read, predicate = Boolean)
@@ -164,7 +175,8 @@ test('request deadline and disposal abort work without successful late publicati
     assert.equal((await response(paths, next.requestId)).status, 'running');
 });
 
-test('cancellation during asynchronous response preparation suppresses successful publication', async t =>
+test('cancellation during asynchronous response preparation suppresses successful publication',
+    { timeout: 5000 }, async t =>
 {
     const { paths, calls } = await setup(t);
     const marker = makeMarker(randomUUID(), Date.now());
@@ -202,7 +214,7 @@ test('cancellation during asynchronous response preparation suppresses successfu
     calls[0].resolve({ status: 'ok', snapshot: report() });
     try
     {
-        await preparing;
+        await bounded(preparing, 'response preparation');
         await write(paths, makeMarker(marker.requestId, Date.now(), 'cancel', marker));
         await waitFor(() => Promise.resolve(calls[0].signal.aborted));
     }
@@ -211,7 +223,8 @@ test('cancellation during asynchronous response preparation suppresses successfu
     assert.deepEqual(commits, ['cancelled']);
 });
 
-test('response commit cannot yield to disposal before successful publication becomes visible', async t =>
+test('response commit cannot yield to disposal before successful publication becomes visible',
+    { timeout: 5000 }, async t =>
 {
     const { paths, calls, server } = await setup(t);
     const marker = makeMarker(randomUUID(), Date.now());
@@ -246,8 +259,8 @@ test('response commit cannot yield to disposal before successful publication bec
         events.push('committed');
     });
     calls[0].resolve({ status: 'ok', snapshot: report() });
-    await cancellation;
-    await disposal;
+    await bounded(cancellation, 'response commit');
+    await bounded(disposal, 'runner disposal');
     assert.deepEqual(events, ['committed', 'cancelled']);
     assert.equal((await response(paths, marker.requestId)).status, 'ok');
 });
