@@ -1,0 +1,19 @@
+{
+  "name": "codex-daily-usage",
+  "version": "0.1.2",
+  "private": true,
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.15"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "validate": "node scripts/codexpp.cjs validate-tweak",
+    "install:local": "node scripts/codexpp.cjs dev",
+    "report": "node scripts/report.cjs"
+  },
+  "devDependencies": {
+    "jsdom": "26.1.0"
+  }
+}
