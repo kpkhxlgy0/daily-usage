@@ -2,15 +2,15 @@
 
 独立的 Codex++ tweak，按北京时间查看今天、最近 7 天、最近 30 天的 Token 和 API 等值美元。
 包含本机及本窗口打开过的 Remote Control 机器，按日期和模型拆分。
-版本 0.1.2；最低 Codex++ 1.0.10。无需启用 Session Stats，也不会修改它。
+版本 0.1.3；最低 Codex++ 1.0.10。无需启用 Session Stats，也不会修改它。
 
 ## 安装和使用
 
 推荐在 **Codex++ Settings → Tweak Store** 搜索 **Daily Usage** 并安装。
 运行时无 npm 依赖，安装后打开 Codex 设置中的 Daily Usage 页面。
 
-也可以从 [GitHub Release v0.1.2](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.2)
-下载 `daily-usage-0.1.2.zip`，解压到长期保留的目录。
+也可以从 [GitHub Release v0.1.3](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.3)
+下载 `daily-usage-0.1.3.zip`，解压到长期保留的目录。
 Windows 已安装 Codex++ 时，在解压目录运行：
 
 ```powershell
@@ -19,13 +19,17 @@ pwsh -File .\Inject-CodexPlusPlus.ps1
 ```
 
 打开 Codex 设置中的 **Daily Usage** 页面查看统计。
-该版本恢复原有统计设置页，并移除会错误复制整条原生竖栏的主侧栏快捷入口。
-首次扫描可能需要几分钟，完成后自动显示；启用期间每分钟更新，面板每 5 秒读取状态。
+打开页面、切换机器或点击刷新时，各查询一次；切换日期范围只筛选已返回的数据。
+页面打开期间也不会定时刷新。首次查询可能需要几分钟，完成后自动显示。
+离开、隐藏或关闭页面会取消当前查询；再次打开页面重新查询。
+启用 tweak 不会扫描日志或创建统计 worker，本机和远程都没有后台轮询。
 如果安装后入口尚未出现，重新启动 Codex。统计不调用模型 API。
 
 机器选择默认本机。要查看远程机器，先在本窗口打开该机器上的一条普通会话，
-等待约 5 秒后再打开 Daily Usage。列表显示远程连接 ID，不保证是操作系统机器名。
-运行端也必须安装并启用 Daily Usage，且 Codex 应用需要运行。
+再打开 Daily Usage。机器识别由会话和导航事件触发，没有定时检查。
+列表显示远程连接 ID，不保证是操作系统机器名。
+查看端和运行端都必须安装并启用 Daily Usage 0.1.3 或更新版本，且 Codex 应用需要运行。
+旧版本运行端仍使用旧的后台更新机制，需在那台机器上更新后才会停止。
 只有查看端安装时无法获得远程机器统计；这里不会自动安装远程组件。
 
 禁用可在 Tweaks 中完成，或运行：
@@ -69,12 +73,17 @@ Store 安装副本只会禁用，不删除。脚本使用 `CODEX_PLUSPLUS_HOME`�
 支持 JSONL 和原生 Zstd 压缩历史。压缩读取需要运行时 Node >=22.15 的原生 Zstd；不支持时报告覆盖缺口。
 解析在 worker 中完成，复用没有变化的文件缓存，不将原始聊天正文写进缓存。
 
-运行端写入 `$CODEX_HOME/.daily-usage/machine.json` 和 `summary.json`。
+运行端写入 `$CODEX_HOME/.daily-usage/machine.json` 和 `summary.json`，
+并使用同目录的 `capabilities.json`、`requests/` 和 `responses/` 处理按需查询。
 汇总仅含机器/发布者 ID、时间、按日期模型的 token 和美元、覆盖状态；不含聊天正文或认证信息。
-缓存位于 Codex++ `tweak-data/com.kpk.daily-usage/cache`。禁用会结束 worker、计时器、IPC 和未完成的远程读取。
+缓存位于 Codex++ `tweak-data/com.kpk.daily-usage/cache`。禁用会结束 worker、文件监听、IPC 和未完成的查询。
 
-查看端通过当前 Codex RC 连接读取固定汇总文件，不下载远程原始会话日志。
-超过 3 分钟未更新或连接失败时，显示最后成功缓存和原时间；未读到数据时显示暂无统计，不能当成零消耗。
+远程机器读取自己的日志并完成计算；查看端通过当前 Codex RC 连接发送固定格式的查询/取消标记，
+使用原生文件变更通知等待汇总结果，不下载远程原始会话日志，也不定时读取响应。
+运行端空闲时只保留操作系统的文件事件监听，收到请求才启动统计。
+页面离开后会发送取消标记；如果连接已断开，运行端依靠最长 5 分钟的请求期限结束遗留任务。
+不支持按需协议或原生文件通知时提示更新，不回退到轮询。
+查询失败时保留最后成功缓存和原时间；未读到数据时显示暂无统计，不能当成零消耗。
 机器列表基于实际打开过的会话，不是所有在线主机列表。远程协议依赖 Codex 内部桥接，应用升级可能需要适配。
 
 ## 开发和验证
@@ -99,7 +108,8 @@ CLI 输出 JSON；默认缓存写到所选 CODEX_HOME 的 `.daily-usage/cache`�
 只读原日志，但会写自己的统计缓存。
 
 源码：[kpkhxlgy0/daily-usage](https://github.com/kpkhxlgy0/daily-usage)。
-版本：[v0.1.2](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.2)。
-本机功能及原生压缩日志已验证；远程协议有自动化测试，真实双机 Remote Control 联调尚未完成。
+版本：[v0.1.3](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.3)。
+本机功能及原生压缩日志已验证；按需协议已通过双端文件系统自动化测试，
+0.1.3 的真实双机 Remote Control 通知与取消链路尚待安装更新后验证。
 
 MIT；复用模块及来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

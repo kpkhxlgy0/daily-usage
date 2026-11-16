@@ -10,11 +10,15 @@ function createMain(api, dependencies = {})
 {
     const ipcMain = dependencies.ipcMain || require('electron').ipcMain;
     const serviceFactory = dependencies.serviceFactory || require('./service.cjs').createService;
+    const demandFactory = dependencies.demandFactory || require('./demand-server.cjs').createDemandServer;
     const remoteFactory = dependencies.remoteFactory || require('./remote-store.cjs').createRemoteStore;
     const transportFactory = dependencies.transportFactory || require('./vendor/remote-transport.cjs').createRemoteTransport;
     const bindingScript = dependencies.bindingScript || require('./vendor/binding.cjs').bindingScript;
     const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
     const service = serviceFactory({ codexHome, dataDir: api.fs.dataDir });
+    const demandServer = demandFactory({ codexHome, service });
+    Promise.resolve(demandServer.ready).catch(error => api.log.error('Daily Usage demand receiver unavailable',
+        error.code || 'initialization-failed'));
     const remote = remoteFactory();
     const transport = transportFactory({ timeoutMs: 15000, maxChars: 4 * 1024 * 1024 });
     const hosts = new Map();
@@ -30,6 +34,43 @@ function createMain(api, dependencies = {})
     let stopped = false;
     const channels = [];
     const discovery = new Map();
+    const owners = new Map();
+    const BrowserWindow = dependencies.BrowserWindow
+        || (!dependencies.ipcMain ? require('electron').BrowserWindow : null);
+
+    function releaseOwner(owner)
+    {
+        if (owner.queries.size) return;
+        for (const remove of owner.hooks) remove();
+        owners.delete(owner.frame);
+    }
+    function abortOwner(owner)
+    {
+        for (const controller of owner.queries.values()) controller.abort();
+    }
+    function ownerFor(event)
+    {
+        let owner = owners.get(event.senderFrame);
+        if (owner) return owner;
+        owner = { frame: event.senderFrame, queries: new Map(), hooks: [] };
+        const listen = (target, name, handler) =>
+        {
+            if (typeof target?.on !== 'function') return;
+            target.on(name, handler);
+            owner.hooks.push(() => target.removeListener(name, handler));
+        };
+        const cancel = () => abortOwner(owner);
+        listen(event.sender, 'destroyed', cancel);
+        listen(event.sender, 'render-process-gone', cancel);
+        listen(event.sender, 'did-start-navigation', (_event, _url, _inPlace, main) =>
+        {
+            if (main !== false) cancel();
+        });
+        const window = BrowserWindow?.fromWebContents(event.sender);
+        for (const name of ['hide', 'minimize', 'closed']) listen(window, name, cancel);
+        owners.set(event.senderFrame, owner);
+        return owner;
+    }
     function register(name, fn)
     {
         const channel = `codexpp:${api.manifest.id}:${name}`;
@@ -64,31 +105,64 @@ function createMain(api, dependencies = {})
         discovery.set(frame, pending);
         return pending;
     });
+    register('cancel', (event, payload) =>
+    {
+        if (!payload || !Uuid.test(payload.requestId)
+            || Object.keys(payload).some(key => key !== 'requestId')) return;
+        owners.get(event.senderFrame)?.queries.get(payload.requestId)?.abort();
+    });
     register('report', async (event, payload) =>
     {
-        if (!payload || !validHost(payload.hostId)
-            || Object.keys(payload).some(key => key !== 'hostId' && key !== 'refresh'))
+        if (!payload || !validHost(payload.hostId) || !Uuid.test(payload.requestId)
+            || Object.keys(payload).some(key => key !== 'hostId' && key !== 'requestId'))
             return { status: 'unavailable', error: 'invalid-host' };
-        if (payload.hostId === 'local')
+        const identity = payload.hostId === 'local' ? null : hosts.get(payload.hostId);
+        if (payload.hostId !== 'local' && !identity)
+            return { status: 'unavailable', error: 'open-remote-conversation' };
+        const owner = ownerFor(event);
+        if (owner.queries.has(payload.requestId)) return { status: 'unavailable', error: 'duplicate-query' };
+        const controller = new AbortController();
+        owner.queries.set(payload.requestId, controller);
+        try
         {
-            await service.ready;
-            if (payload.refresh) service.refresh();
-            return service.getState();
+            if (payload.hostId === 'local')
+            {
+                await service.ready;
+                if (controller.signal.aborted) return { status: 'unavailable', error: 'cancelled' };
+                return await service.query({ signal: controller.signal });
+            }
+            return await remote.get(identity, (method, params, limits) =>
+                transport.request(event.senderFrame, identity.hostId, method, params, limits), {
+                signal: controller.signal,
+                watch: (target, options) => transport.watch(event.senderFrame, identity.hostId, target, options)
+            });
         }
-        const identity = hosts.get(payload.hostId);
-        if (!identity) return { status: 'unavailable', error: 'open-remote-conversation' };
-        return remote.get(identity, (method, params, limits) =>
-            transport.request(event.senderFrame, identity.hostId, method, params, limits));
+        catch (error)
+        {
+            return { status: 'unavailable', error: controller.signal.aborted || error.name === 'AbortError'
+                ? 'cancelled' : 'query-failed' };
+        }
+        finally
+        {
+            owner.queries.delete(payload.requestId);
+            releaseOwner(owner);
+        }
     });
-    api.log.info('Daily Usage main started; independent local collector and remote aggregate reader');
+    api.log.info('Daily Usage main started; on-demand queries, idle filesystem listener, no background polling');
     return {
         async stop()
         {
             if (stopped) return;
             stopped = true;
             for (const channel of channels) ipcMain.removeHandler(channel);
+            for (const owner of owners.values()) abortOwner(owner);
+            await Promise.allSettled([demandServer.dispose(), service.dispose(), remote.dispose()]);
             transport.dispose();
-            await Promise.allSettled([service.dispose(), remote.dispose()]);
+            for (const owner of [...owners.values()])
+            {
+                owner.queries.clear();
+                releaseOwner(owner);
+            }
         }
     };
 }

@@ -2,6 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
+const nativeFs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { EventEmitter } = require('node:events');
@@ -18,62 +19,211 @@ function body()
 async function setup(t)
 {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'daily-usage-service-'));
-    const worker = new EventEmitter();
-    worker.postMessage = () => {};
-    worker.terminate = async () => { worker.terminated = true; };
+    const workers = [];
     const service = createService({ codexHome: root, dataDir: path.join(root, 'data'),
-        workerFactory: () => worker, now: () => body().generatedAt, refreshMs: 100000 });
+        workerFactory: () =>
+        {
+            const worker = new EventEmitter();
+            worker.postMessage = message => { worker.command = message; };
+            worker.terminate = async () => { worker.terminated = true; };
+            workers.push(worker);
+            return worker;
+        }, now: () => body().generatedAt });
     t.after(async () => { await service.dispose(); await fs.rm(root, { recursive: true }); });
     await service.ready;
-    return { root, worker, service };
+    return { root, workers, service };
 }
 
-test('publishes validated aggregate atomically, keeping machine identity across restart', async t =>
+async function started(service, workers, options)
 {
-    const { root, worker, service } = await setup(t);
-    worker.emit('message', { type: 'result', report: body() });
-    await service.settled();
+    const result = service.query(options);
+    await new Promise(resolve => setImmediate(resolve));
+    return { result, worker: workers.at(-1) };
+}
+
+test('startup and idle never create a collector; each query awaits a fresh terminated worker', async t =>
+{
+    const { root, workers, service } = await setup(t);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(workers.length, 0);
+    assert.equal(service.getState().status, 'unavailable');
+    const first = await started(service, workers);
+    let resolved = false;
+    first.result.then(() => { resolved = true; });
+    assert.equal(resolved, false);
+    assert.equal(first.worker.command.type, 'scan');
+    first.worker.emit('message', { type: 'result', report: body() });
+    const state = await first.result;
+    assert.equal(state.status, 'ok');
+    assert.equal(first.worker.terminated, true);
     const report = JSON.parse(await fs.readFile(path.join(root, '.daily-usage/summary.json'), 'utf8'));
     assert.equal(report.source, 'com.kpk.daily-usage');
     assert.equal(report.revision, 1);
-    assert.equal(service.getState().status, 'ok');
-    assert.match(report.machineId, /^[0-9a-f-]{36}$/);
-    worker.emit('message', { type: 'result', report: body() });
-    await service.settled();
-    assert.equal(service.getState().snapshot.revision, 2);
+    const second = await started(service, workers);
+    assert.equal(workers.length, 2);
+    second.worker.emit('message', { type: 'result', report: body() });
+    assert.equal((await second.result).snapshot.revision, 2);
+    const published = await fs.readFile(path.join(root, '.daily-usage/summary.json'), 'utf8');
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.equal(workers.length, 2);
+    assert.equal(await fs.readFile(path.join(root, '.daily-usage/summary.json'), 'utf8'), published);
     await service.dispose();
-    const nextWorker = new EventEmitter();
-    nextWorker.postMessage = () => {};
-    nextWorker.terminate = async () => {};
+    let created = false;
     const next = createService({ codexHome: root, dataDir: path.join(root, 'data'),
-        workerFactory: () => nextWorker, now: () => body().generatedAt });
+        workerFactory: () => { created = true; throw new Error('eager-worker'); }, now: () => body().generatedAt });
     t.after(() => next.dispose());
     await next.ready;
+    assert.equal(created, false);
     assert.equal(next.getState().snapshot.machineId, report.machineId);
+    assert.equal(next.getState().status, 'stale');
 });
 
-test('invalid worker result never replaces last successful report', async t =>
+test('shared subscribers cancel independently and the last cancellation invalidates late results', async t =>
 {
-    const { worker, service } = await setup(t);
-    worker.emit('message', { type: 'result', report: body() });
-    await service.settled();
-    worker.emit('message', { type: 'result', report: { ...body(), rows: [{ usd: -1 }] } });
-    await service.settled();
+    const { root, workers, service } = await setup(t);
+    const one = new AbortController();
+    const two = new AbortController();
+    const first = await started(service, workers, { signal: one.signal });
+    const second = service.query({ signal: two.signal });
+    await new Promise(resolve => setImmediate(resolve));
+    const firstRejected = assert.rejects(first.result, { name: 'AbortError', code: 'ABORT_ERR' });
+    one.abort();
+    await firstRejected;
+    assert.equal(first.worker.terminated, undefined);
+    first.worker.emit('message', { type: 'result', report: body() });
+    assert.equal((await second).status, 'ok');
+    assert.equal(workers.length, 1);
+    const last = new AbortController();
+    const third = await started(service, workers, { signal: last.signal });
+    const thirdRejected = assert.rejects(third.result, { name: 'AbortError' });
+    last.abort();
+    await thirdRejected;
+    assert.equal(third.worker.terminated, true);
+    third.worker.emit('message', { type: 'result', report: body() });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const published = JSON.parse(await fs.readFile(path.join(root, '.daily-usage/summary.json'), 'utf8'));
+    assert.equal(published.revision, 1);
     assert.equal(service.getState().snapshot.revision, 1);
-    assert.equal(service.getState().status, 'error');
 });
 
-test('dispose terminates scanning and rejects late publication', async t =>
+test('invalid results retain the last successful report and terminate the failed worker', async t =>
 {
-    const { root, worker, service } = await setup(t);
+    const { workers, service } = await setup(t);
+    const first = await started(service, workers);
+    first.worker.emit('message', { type: 'result', report: body() });
+    await first.result;
+    const second = await started(service, workers);
+    second.worker.emit('message', { type: 'result', report: { ...body(), rows: [{ usd: -1 }] } });
+    const state = await second.result;
+    assert.equal(state.snapshot.revision, 1);
+    assert.equal(state.status, 'error');
+    assert.equal(second.worker.terminated, true);
+});
+
+test('disposal rejects active and future queries without allowing late publication', async t =>
+{
+    const { root, workers, service } = await setup(t);
+    const first = await started(service, workers);
+    const rejected = assert.rejects(first.result, { name: 'AbortError' });
     await service.dispose();
-    worker.emit('message', { type: 'result', report: body() });
-    await service.settled();
-    assert.equal(worker.terminated, true);
+    await rejected;
+    assert.equal(first.worker.terminated, true);
+    first.worker.emit('message', { type: 'result', report: body() });
+    await assert.rejects(service.query(), { name: 'AbortError' });
     await assert.rejects(fs.access(path.join(root, '.daily-usage/summary.json')), { code: 'ENOENT' });
 });
 
-test('real worker publishes a priced row from the native top-level usage envelope', async t =>
+test('pre-aborted queries do not create workers', async t =>
+{
+    const { workers, service } = await setup(t);
+    await assert.rejects(service.query({ signal: AbortSignal.abort() }), { name: 'AbortError' });
+    assert.equal(workers.length, 0);
+});
+
+test('cancellation during asynchronous publication preparation leaves no summary or temporary file', async t =>
+{
+    const { root, workers, service } = await setup(t);
+    const controller = new AbortController();
+    const first = await started(service, workers, { signal: controller.signal });
+    let prepared;
+    let release;
+    const preparing = new Promise(resolve => { prepared = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const writeFile = fs.writeFile;
+    t.mock.method(fs, 'writeFile', async (file, ...args) =>
+    {
+        const result = await writeFile(file, ...args);
+        if (path.basename(file).startsWith('.summary.json.'))
+        {
+            prepared();
+            await gate;
+        }
+        return result;
+    });
+    first.worker.emit('message', { type: 'result', report: body() });
+    try
+    {
+        await preparing;
+        const rejected = assert.rejects(first.result, { name: 'AbortError' });
+        controller.abort();
+        await rejected;
+    }
+    finally { release(); }
+    await service.dispose();
+    const names = await fs.readdir(path.join(root, '.daily-usage'));
+    assert.equal(names.includes('summary.json'), false);
+    assert.equal(names.some(name => name.startsWith('.summary.json.')), false);
+});
+
+test('publication commit cannot yield to cancellation before the summary becomes visible', async t =>
+{
+    const { root, workers, service } = await setup(t);
+    const controller = new AbortController();
+    const first = await started(service, workers, { signal: controller.signal });
+    const summary = path.join(root, '.daily-usage/summary.json');
+    const events = [];
+    const cancel = () => queueMicrotask(() =>
+    {
+        events.push('cancelled');
+        controller.abort();
+    });
+    const rename = fs.rename;
+    const renameSync = nativeFs.renameSync;
+    t.mock.method(fs, 'rename', async (from, to) =>
+    {
+        if (to !== summary) return rename(from, to);
+        cancel();
+        await new Promise(resolve => setImmediate(resolve));
+        await rename(from, to);
+        events.push('committed');
+    });
+    t.mock.method(nativeFs, 'renameSync', (from, to) =>
+    {
+        if (to !== summary) return renameSync(from, to);
+        cancel();
+        renameSync(from, to);
+        events.push('committed');
+    });
+    first.worker.emit('message', { type: 'result', report: body() });
+    await first.result.catch(error => assert.equal(error.name, 'AbortError'));
+    await service.dispose();
+    assert.deepEqual(events, ['committed', 'cancelled']);
+    assert.equal(JSON.parse(await fs.readFile(summary, 'utf8')).revision, 1);
+});
+
+test('worker failures and unexpected exits resolve an error state and allow retry', async t =>
+{
+    const { workers, service } = await setup(t);
+    const first = await started(service, workers);
+    first.worker.emit('error', new Error('read-failed'));
+    assert.equal((await first.result).error, 'read-failed');
+    assert.equal(first.worker.terminated, true);
+    const second = await started(service, workers);
+    second.worker.emit('exit', 1);
+    assert.equal((await second.result).error, 'collector-exited-1');
+});
+
+test('real worker publishes a priced native usage row then remains idle', async t =>
 {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'daily-usage-worker-'));
     const threadId = '22222222-2222-4222-8222-222222222222';
@@ -91,12 +241,14 @@ test('real worker publishes a priced row from the native top-level usage envelop
     const service = createService({ codexHome: root, dataDir: path.join(root, 'data') });
     t.after(async () => { await service.dispose(); await fs.rm(root, { recursive: true }); });
     await service.ready;
-    const end = Date.now() + 6000;
-    while (service.getState().status === 'loading' && Date.now() < end)
-        await new Promise(resolve => setTimeout(resolve, 20));
-    assert.equal(service.getState().status, 'ok', JSON.stringify(service.getState()));
-    const row = service.getState().snapshot.rows[0];
+    const state = await service.query();
+    assert.equal(state.status, 'ok', JSON.stringify(state));
+    const row = state.snapshot.rows[0];
     assert.equal(row?.requests, 1);
     assert.equal(row?.outputTokens, 100);
     assert.equal(row?.usd, 0.00129);
+    const reportFile = path.join(root, '.daily-usage/summary.json');
+    const before = await fs.stat(reportFile);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.equal((await fs.stat(reportFile)).mtimeMs, before.mtimeMs);
 });

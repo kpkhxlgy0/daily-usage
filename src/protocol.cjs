@@ -112,5 +112,5 @@ function snapshotContext(rolloutPath, threadId) {
     return null;
 }
 
-module.exports = { validateSnapshot, snapshotContext, normalizeThreadId, validHostId,
+module.exports = { validateSnapshot, snapshotContext, normalizeThreadId, validHostId, safePath,
     MaxSnapshotBytes, StaleAfterMs, FutureSkewMs };

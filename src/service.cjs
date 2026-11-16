@@ -1,13 +1,11 @@
 'use strict';
 
 const fs = require('node:fs/promises');
+const nativeFs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { Worker } = require('node:worker_threads');
-const { validateSnapshot } = require('./protocol.cjs');
-
-const MaxSnapshotBytes = 2 * 1024 * 1024;
-const Uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const { validateSnapshot, MaxSnapshotBytes, normalizeThreadId } = require('./protocol.cjs');
 
 async function ensureDirectory(directory)
 {
@@ -35,10 +33,11 @@ async function atomicWrite(file, value, active = () => true)
     {
         await fs.writeFile(temp, JSON.stringify(value), { flag: 'wx', mode: 0o600 });
         const after = await fs.lstat(directory);
-        if (!active()) return;
         if (after.isSymbolicLink() || before.ino !== after.ino || before.dev !== after.dev)
             throw new Error('data-directory-changed');
-        await fs.rename(temp, file);
+        if (!active()) return;
+        // 最终判定与原子提交不让出事件循环；提交后的取消不撤销已发布文件。
+        nativeFs.renameSync(temp, file);
     }
     finally
     {
@@ -46,35 +45,124 @@ async function atomicWrite(file, value, active = () => true)
     }
 }
 
-function createService({ codexHome, dataDir, now = Date.now, refreshMs = 60000,
+function abortError()
+{
+    return Object.assign(new Error('Daily Usage query cancelled'), { name: 'AbortError', code: 'ABORT_ERR' });
+}
+
+function createService({ codexHome, dataDir, now = Date.now,
     workerFactory = options => new Worker(path.join(__dirname, 'worker.cjs'), options) })
 {
     const directory = path.join(codexHome, '.daily-usage');
     const reportFile = path.join(directory, 'summary.json');
     const publisherId = randomUUID();
+    const pending = new Set();
+    const terminations = new Set();
     let machineId;
     let revision = 0;
     let stopped = false;
-    let worker;
-    let timer;
-    let busy = false;
-    let state = { status: 'loading', progress: null };
+    let current;
+    let initializationError;
+    let state = { status: 'unavailable', progress: null };
     let publishing = Promise.resolve();
     let disposal;
 
-    const fail = error =>
+    function terminate(job)
     {
-        if (stopped) return;
-        busy = false;
-        state = { ...state, status: 'error', error: String(error?.message || error).slice(0, 180), progress: null };
-    };
+        if (job.termination) return job.termination;
+        job.termination = Promise.resolve(job.worker?.terminate()).catch(() => {});
+        terminations.add(job.termination);
+        job.termination.finally(() => terminations.delete(job.termination));
+        return job.termination;
+    }
 
-    function refresh()
+    const active = job => !stopped && current === job && job.subscribers.size > 0;
+
+    function settle(subscriber, error, value)
     {
-        if (stopped || busy || !worker) return;
-        busy = true;
+        if (subscriber.settled) return;
+        subscriber.settled = true;
+        pending.delete(subscriber);
+        subscriber.signal?.removeEventListener('abort', subscriber.abort);
+        if (error) subscriber.reject(error);
+        else subscriber.resolve(value);
+    }
+
+    function abandon(job)
+    {
+        if (current !== job) return;
+        current = null;
+        state = { ...state, status: state.snapshot ? 'stale' : 'unavailable', progress: null };
+        terminate(job);
+    }
+
+    async function complete(job, error, snapshot)
+    {
+        if (!active(job)) return;
+        await terminate(job);
+        if (!active(job)) return;
+        current = null;
+        if (error)
+            state = { ...state, status: 'error', error: String(error.message || error).slice(0, 180), progress: null };
+        else
+        {
+            revision++;
+            state = { status: 'ok', snapshot, progress: null };
+        }
+        for (const subscriber of job.subscribers) settle(subscriber, null, state);
+        job.subscribers.clear();
+    }
+
+    function start(job)
+    {
         state = { ...state, status: 'loading', error: null, progress: null };
-        worker.postMessage({ type: 'scan' });
+        try
+        {
+            job.worker = workerFactory({ workerData: { codexHome, cacheDir: path.join(dataDir, 'cache') } });
+            job.worker.on('message', message =>
+            {
+                if (!active(job) || job.finished) return;
+                if (message?.type === 'progress') state = { ...state, progress: message.progress };
+                else if (message?.type === 'error')
+                {
+                    job.finished = true;
+                    void complete(job, message.error || 'collector-failed');
+                }
+                else if (message?.type === 'result')
+                {
+                    job.finished = true;
+                    publishing = publishing.then(async () =>
+                    {
+                        if (!active(job)) return;
+                        const snapshot = { ...message.report, schemaVersion: 1, source: 'com.kpk.daily-usage',
+                            machineId, publisherId, revision: revision + 1 };
+                        if (!validateSnapshot(snapshot, { now: now() }).ok
+                            || Buffer.byteLength(JSON.stringify(snapshot)) > MaxSnapshotBytes)
+                            throw new Error('invalid-report');
+                        await atomicWrite(reportFile, snapshot, () => active(job));
+                        await complete(job, null, snapshot);
+                    }).catch(error => complete(job, error));
+                }
+            });
+            job.worker.on('error', error =>
+            {
+                if (!active(job) || job.finished) return;
+                job.finished = true;
+                void complete(job, error);
+            });
+            job.worker.on('exit', code =>
+            {
+                if (!active(job) || job.finished) return;
+                job.finished = true;
+                void complete(job, `collector-exited-${code}`);
+            });
+            job.worker.postMessage({ type: 'scan' });
+        }
+        catch (error)
+        {
+            job.finished = true;
+            void complete(job, error);
+        }
     }
 
     const ready = (async () =>
@@ -85,7 +173,7 @@ function createService({ codexHome, dataDir, now = Date.now, refreshMs = 60000,
         try
         {
             const value = await readJson(identityFile, 1024);
-            if (!Uuid.test(value.machineId)) throw new Error('invalid-machine-identity');
+            if (!normalizeThreadId(value.machineId)) throw new Error('invalid-machine-identity');
             machineId = value.machineId;
         }
         catch (error)
@@ -98,55 +186,60 @@ function createService({ codexHome, dataDir, now = Date.now, refreshMs = 60000,
         {
             const previous = await readJson(reportFile);
             if (validateSnapshot(previous, { now: now() }).ok && previous.machineId === machineId)
-                state = { status: 'loading', snapshot: previous, progress: null };
+                state = { status: 'stale', snapshot: previous, progress: null };
         }
-        catch { /* 缓存损坏时重新统计，不改写原始日志。 */ }
-        if (stopped) return;
-        worker = workerFactory({ workerData: { codexHome, cacheDir: path.join(dataDir, 'cache') } });
-        worker.on('message', message =>
-        {
-            if (stopped) return;
-            if (message.type === 'progress') state = { ...state, progress: message.progress };
-            else if (message.type === 'error') fail(message.error);
-            else if (message.type === 'result')
-            {
-                publishing = publishing.then(async () =>
-                {
-                    if (stopped) return;
-                    const snapshot = { ...message.report, schemaVersion: 1, source: 'com.kpk.daily-usage',
-                        machineId, publisherId, revision: revision + 1 };
-                    if (!validateSnapshot(snapshot, { now: now() }).ok
-                        || Buffer.byteLength(JSON.stringify(snapshot)) > MaxSnapshotBytes)
-                        throw new Error('invalid-report');
-                    await atomicWrite(reportFile, snapshot, () => !stopped);
-                    if (stopped) return;
-                    revision++;
-                    busy = false;
-                    state = { status: 'ok', snapshot, progress: null };
-                }).catch(fail);
-            }
-        });
-        worker.on('error', fail);
-        worker.on('exit', code => { if (!stopped) { worker = null; fail(`collector-exited-${code}`); } });
-        refresh();
-        timer = setInterval(refresh, refreshMs);
-        timer.unref?.();
-    })().catch(fail);
+        catch { /* 缓存损坏时仅在查询时重新统计，不改写原始日志。 */ }
+    })().catch(error =>
+    {
+        initializationError = error;
+        state = { status: 'error', error: String(error.message || error).slice(0, 180), progress: null };
+    });
 
     return {
-        ready, refresh,
+        ready,
         getState: () => state,
-        settled: () => publishing,
+        query({ signal } = {})
+        {
+            if (stopped || signal?.aborted) return Promise.reject(abortError());
+            return new Promise((resolve, reject) =>
+            {
+                const subscriber = { resolve, reject, signal };
+                subscriber.abort = () =>
+                {
+                    settle(subscriber, abortError());
+                    const job = subscriber.job;
+                    if (!job) return;
+                    job.subscribers.delete(subscriber);
+                    if (!job.subscribers.size) abandon(job);
+                };
+                pending.add(subscriber);
+                signal?.addEventListener('abort', subscriber.abort, { once: true });
+                ready.then(() =>
+                {
+                    if (subscriber.settled) return;
+                    if (stopped || signal?.aborted) return subscriber.abort();
+                    if (initializationError) return settle(subscriber, null, state);
+                    const job = current || { subscribers: new Set() };
+                    subscriber.job = job;
+                    job.subscribers.add(subscriber);
+                    if (!current)
+                    {
+                        current = job;
+                        start(job);
+                    }
+                });
+            });
+        },
         dispose()
         {
             if (disposal) return disposal;
             stopped = true;
-            clearInterval(timer);
+            for (const subscriber of [...pending]) subscriber.abort();
             disposal = (async () =>
             {
                 await ready;
-                if (worker) await worker.terminate();
                 await publishing;
+                await Promise.all([...terminations]);
             })();
             return disposal;
         }

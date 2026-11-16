@@ -13,7 +13,20 @@ function localDate(milliseconds)
     return new Date(milliseconds + 8 * 3600000).toISOString().slice(0, 10);
 }
 
-function mountPanel(root, { getHosts, getReport, now = Date.now, pollMs = 5000 })
+function visibleElement(element)
+{
+    const doc = element.ownerDocument;
+    if (!element.isConnected || doc.visibilityState === 'hidden') return false;
+    for (let node = element; node; node = node.parentElement)
+    {
+        const style = doc.defaultView.getComputedStyle(node);
+        if (node.hidden || node.getAttribute('aria-hidden') === 'true'
+            || style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility)) return false;
+    }
+    return true;
+}
+
+function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = Date.now })
 {
     const doc = root.ownerDocument;
     const win = doc.defaultView;
@@ -21,6 +34,8 @@ function mountPanel(root, { getHosts, getReport, now = Date.now, pollMs = 5000 }
     let requestVersion = 0;
     let reportState;
     let fetching = false;
+    let visible = false;
+    let activeQuery;
     const hostNames = new Map([['local', '本机']]);
     const panel = doc.createElement('section');
     panel.className = 'daily-usage-panel';
@@ -90,7 +105,9 @@ function mountPanel(root, { getHosts, getReport, now = Date.now, pollMs = 5000 }
                     : dollars.format(totals.usd)) : counts.format(totals[key])) : '—';
         }
         const stale = snapshot && (state === 'stale' || state === 'error' || now() - snapshot.generatedAt > 180000);
-        status.textContent = state === 'loading' ? '正在扫描本机日志，完成后会自动更新…'
+        status.textContent = reportState?.error === 'snapshot-update-required'
+            ? '远端暂不支持按需查询，请确认两端均已启用 Daily Usage 0.1.3 或更新版本，且 Codex 支持文件通知。'
+            : state === 'loading' ? '正在查询所选机器，完成后显示结果…'
             : stale ? '显示最后成功的缓存数据；当前连接不可用或统计尚未更新。'
             : snapshot ? `${hostNames.get(host.value) || host.value} · 统计已更新`
             : state === 'error' && host.value === 'local' ? '本机统计暂不可用，请稍后刷新。'
@@ -126,29 +143,47 @@ function mountPanel(root, { getHosts, getReport, now = Date.now, pollMs = 5000 }
             ? `价格表日期：${snapshot.pricing.asOf}。仅含模型 Token 费用，不含图像生成等工具独立收费。` : '';
     }
 
-    async function update(force = false, changed = false)
+    function cancelActive()
     {
-        if (!alive || (fetching && !changed)) return;
+        requestVersion++;
+        const query = activeQuery;
+        activeQuery = null;
+        fetching = false;
+        refresh.disabled = false;
+        if (query)
+        {
+            try { Promise.resolve(cancelReport(query.id)).catch(() => {}); }
+            catch { /* 主进程已退出时无需继续取消。 */ }
+        }
+    }
+
+    async function update(changed = false)
+    {
+        if (!alive || !visible || !visibleElement(panel) || (fetching && !changed)) return;
+        if (activeQuery) cancelActive();
         const version = ++requestVersion;
+        const query = activeQuery = { id: win.crypto.randomUUID() };
         fetching = true;
         refresh.disabled = true;
-        if (changed) { reportState = undefined; render(); }
+        reportState = { status: 'loading', snapshot: changed ? undefined : reportState?.snapshot };
+        render();
         const selected = host.value;
         try
         {
-            const result = await getReport(selected, { refresh: force });
-            if (!alive || version !== requestVersion) return;
+            const result = await getReport(selected, { requestId: query.id });
+            if (!alive || !visibleElement(panel) || version !== requestVersion) return;
             reportState = result;
             render();
         }
         catch
         {
-            if (!alive || version !== requestVersion) return;
+            if (!alive || !visibleElement(panel) || version !== requestVersion) return;
             reportState = { status: reportState?.snapshot ? 'stale' : 'unavailable', snapshot: reportState?.snapshot };
             render();
         }
         finally
         {
+            if (activeQuery === query) activeQuery = null;
             if (alive && version === requestVersion) { fetching = false; refresh.disabled = false; }
         }
     }
@@ -158,7 +193,7 @@ function mountPanel(root, { getHosts, getReport, now = Date.now, pollMs = 5000 }
         try
         {
             const hosts = await getHosts();
-            if (!alive) return;
+            if (!alive || !visibleElement(panel)) return;
             for (const entry of hosts)
             {
                 if (hostNames.has(entry.hostId)) continue;
@@ -172,26 +207,56 @@ function mountPanel(root, { getHosts, getReport, now = Date.now, pollMs = 5000 }
         catch { /* 主进程重载期间保留已经确认的机器列表。 */ }
     }
 
-    host.addEventListener('change', () => { void update(false, true); });
+    host.addEventListener('change', () => { void update(true); });
     range.addEventListener('change', render);
-    refresh.addEventListener('click', () => { void update(true); });
-    void loadHosts();
-    void update();
-    const timer = win.setInterval(() =>
+    refresh.addEventListener('click', () => { void update(); });
+    const observer = new win.MutationObserver(reconcileVisibility);
+    function observeAncestors()
     {
-        if (doc.visibilityState === 'hidden') return;
-        void loadHosts();
-        void update();
-    }, pollMs);
-    return () => { alive = false; requestVersion++; win.clearInterval(timer); panel.remove(); };
+        observer.disconnect();
+        for (let node = panel; node; node = node.parentElement)
+            observer.observe(node, { childList: true, attributes: true,
+                attributeFilter: ['style', 'class', 'hidden', 'aria-hidden'] });
+    }
+    function stop()
+    {
+        if (!alive) return;
+        alive = false;
+        visible = false;
+        cancelActive();
+        observer.disconnect();
+        doc.removeEventListener('visibilitychange', reconcileVisibility);
+        win.removeEventListener('pagehide', stop);
+        panel.remove();
+    }
+    function reconcileVisibility()
+    {
+        if (!alive) return;
+        if (!panel.isConnected) { stop(); return; }
+        const next = visibleElement(panel);
+        observeAncestors();
+        if (next === visible) return;
+        visible = next;
+        if (visible) { void loadHosts(); void update(); }
+        else cancelActive();
+    }
+    doc.addEventListener('visibilitychange', reconcileVisibility);
+    win.addEventListener('pagehide', stop);
+    reconcileVisibility();
+    return stop;
 }
 
 function startRenderer(api, { window: win = window, document: doc = document } = {})
 {
     const cleanups = new Set();
     let stopped = false;
-    const data = { getHosts: () => api.ipc.invoke('hosts'),
-        getReport: (hostId, options) => api.ipc.invoke('report', { hostId, ...options }) };
+    const data = { getHosts: async () =>
+        {
+            await api.ipc.invoke('discover');
+            return api.ipc.invoke('hosts');
+        },
+        getReport: (hostId, options) => api.ipc.invoke('report', { hostId, ...options }),
+        cancelReport: requestId => api.ipc.invoke('cancel', { requestId }) };
     function mount(root)
     {
         const release = mountPanel(root, data);
@@ -202,21 +267,55 @@ function startRenderer(api, { window: win = window, document: doc = document } =
     const page = api.settings?.registerPage({ id: 'daily-usage', title: 'Daily Usage',
         description: '每日 Token 与 API 等值费用', render: mount });
     let discovering = false;
-    async function discover()
+    let rediscover = false;
+    let queued = false;
+    let lastIdentityKey;
+    let nextRootId = 0;
+    const rootIds = new WeakMap();
+    const navigationEvents = ['popstate', 'hashchange', 'codexpp-pushState', 'codexpp-replaceState'];
+    async function discoverChangedConversation()
     {
-        if (stopped || discovering || doc.visibilityState === 'hidden') return;
+        queued = false;
+        if (stopped || doc.visibilityState === 'hidden') return;
+        if (discovering) { rediscover = true; return; }
+        const roots = [...doc.querySelectorAll('[data-codex-composer-root],[data-app-shell-pane-content-viewport]')]
+            .filter(visibleElement);
+        if (!roots.length) return;
+        const identityKey = JSON.stringify([win.location.href, ...roots.map(root =>
+        {
+            if (!rootIds.has(root)) rootIds.set(root, ++nextRootId);
+            return [rootIds.get(root), root.dataset.conversationId, root.dataset.threadId, root.dataset.hostId];
+        })]);
+        if (identityKey === lastIdentityKey) return;
+        lastIdentityKey = identityKey;
         discovering = true;
         try { await api.ipc.invoke('discover'); }
         catch { /* 在主进程准备好后重试。 */ }
-        finally { discovering = false; }
+        finally
+        {
+            discovering = false;
+            if (rediscover) { rediscover = false; scheduleDiscovery(); }
+        }
     }
-    const timer = win.setInterval(discover, 5000);
-    void discover();
-    api.log.info('Daily Usage renderer started; settings page only, no main-sidebar action');
+    function scheduleDiscovery()
+    {
+        if (queued || stopped) return;
+        queued = true;
+        Promise.resolve().then(discoverChangedConversation);
+    }
+    const conversationObserver = new win.MutationObserver(scheduleDiscovery);
+    conversationObserver.observe(doc.documentElement, { childList: true, subtree: true, attributes: true,
+        attributeFilter: ['data-conversation-id', 'data-thread-id', 'data-host-id'] });
+    for (const event of navigationEvents) win.addEventListener(event, scheduleDiscovery);
+    doc.addEventListener('visibilitychange', scheduleDiscovery);
+    scheduleDiscovery();
+    api.log.info('Daily Usage renderer started; on-demand settings page, no polling');
     return { stop()
     {
         stopped = true;
-        win.clearInterval(timer);
+        conversationObserver.disconnect();
+        for (const event of navigationEvents) win.removeEventListener(event, scheduleDiscovery);
+        doc.removeEventListener('visibilitychange', scheduleDiscovery);
         for (const cleanup of [...cleanups]) cleanup();
         page?.unregister();
     } };

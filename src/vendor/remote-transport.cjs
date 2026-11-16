@@ -2,8 +2,99 @@
 "use strict";
 
 const { randomUUID } = require("node:crypto");
-const { validHostId } = require("../protocol.cjs");
+const { validHostId, safePath, normalizeThreadId } = require("../protocol.cjs");
+const { validateMarker, MaxDemandBytes } = require("../demand-protocol.cjs");
 const ReadMethods = new Set(["thread/read", "fs/getMetadata", "fs/readFile"]);
+
+function protocolPath(value, child) {
+    const safe = safePath(value);
+    if (!safe) return null;
+    const api = safe.pathApi;
+    const parent = child === "requests" ? api.dirname(safe.filename) : safe.filename;
+    if (api.basename(parent) !== child || api.basename(api.dirname(parent)) !== ".daily-usage") return null;
+    return safe;
+}
+
+function validWrite(params) {
+    if (!params || Object.keys(params).length !== 2 || !Object.hasOwn(params, "path")
+        || !Object.hasOwn(params, "dataBase64") || typeof params.dataBase64 !== "string"
+        || params.dataBase64.length > Math.ceil(MaxDemandBytes / 3) * 4) return false;
+    const safe = protocolPath(params.path, "requests");
+    if (!safe) return false;
+    const name = safe.pathApi.basename(safe.filename);
+    const id = normalizeThreadId(name.slice(0, -5));
+    if (!name.endsWith(".json") || !id) return false;
+    try {
+        const bytes = Buffer.from(params.dataBase64, "base64");
+        const text = bytes.toString("utf8");
+        if (bytes.length > MaxDemandBytes || bytes.toString("base64") !== params.dataBase64
+            || !Buffer.from(text).equals(bytes)) return false;
+        const marker = JSON.parse(text);
+        return marker.requestId === id && validateMarker(marker, { now: Date.now() }).ok;
+    } catch { return false; }
+}
+
+// 页面内只保留有界的订阅状态；next 等待原生通知，不创建轮询定时器。
+function watchInPage(options, rpc) {
+    const { stateKey, watchId, hostId, path, expiresAtMs, cancelEvent, maxChars } = options;
+    if (expiresAtMs <= Date.now()) return Promise.reject(new Error("Daily Usage watch timed out"));
+    const states = window[stateKey] ??= new Map();
+    if (states.size >= 32) return Promise.reject(new Error("Daily Usage watch capacity exceeded"));
+    let stopped = false;
+    let queued = false;
+    let waiting;
+    let sequence = 0;
+    const request = (method, params) => rpc({ hostId, id: `${watchId}:${++sequence}`, method, params,
+        expiresAtMs: Date.now() + Math.max(1, Math.min(method === "fs/unwatch" ? 1000 : 5000,
+            expiresAtMs - options.startedAtMs)), maxChars, cancelEvent });
+    const unwatch = () => request("fs/unwatch", { watchId }).catch(() => {});
+    function stop() {
+        if (stopped) return Promise.resolve();
+        stopped = true;
+        window.removeEventListener("message", receive);
+        window.removeEventListener("pagehide", stop);
+        states.delete(watchId);
+        if (!states.size) delete window[stateKey];
+        waiting?.reject(new Error("Daily Usage watch cancelled"));
+        waiting = null;
+        return unwatch();
+    }
+    function receive(event) {
+        if (stopped || event.source != null && (event.source !== window
+            || window.location.origin !== "null" && event.origin !== window.location.origin)) return;
+        const message = event.data;
+        if (message?.type !== "mcp-notification" || message.hostId !== hostId
+            || message.method !== "fs/changed" || message.params?.watchId !== watchId) return;
+        if (waiting) {
+            const current = waiting;
+            waiting = null;
+            current.resolve();
+        } else queued = true;
+    }
+    states.set(watchId, { dispose: stop, next() {
+        if (stopped) return Promise.reject(new Error("Daily Usage watch cancelled"));
+        if (queued) { queued = false; return Promise.resolve(); }
+        if (!waiting) {
+            let resolve;
+            let reject;
+            const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+            waiting = { promise, resolve, reject };
+        }
+        return waiting.promise;
+    } });
+    window.addEventListener("message", receive);
+    window.addEventListener("pagehide", stop);
+    return request("fs/watch", { path, watchId }).then(async () => {
+        if (stopped) { await unwatch(); throw new Error("Daily Usage watch cancelled"); }
+    }, async error => { await stop(); throw error; });
+}
+
+function watchOperationInPage(stateKey, watchId, action) {
+    const state = window[stateKey]?.get(watchId);
+    if (state) return state[action]();
+    if (action === "next") return Promise.reject(new Error("Daily Usage watch disposed"));
+    return Promise.resolve();
+}
 
 // 此函数整体序列化到主页面，使用现有连接；不访问 Node 或更改应用的消息处理器。
 function requestInPage(options) {
@@ -220,6 +311,8 @@ function createRemoteTransport({ timeoutMs = 5000, maxChars = 3 * 1024 * 1024 } 
     maxChars = Math.min(maxChars, 3 * 1024 * 1024);
     const pending = new Set();
     const cancelEvent = `daily-usage-cancel-${randomUUID()}`;
+    const stateKey = `__dailyUsageWatch_${randomUUID()}`;
+    const watches = new Set();
     let disposed = false;
 
     function cancelPage(frame, id) {
@@ -231,7 +324,8 @@ function createRemoteTransport({ timeoutMs = 5000, maxChars = 3 * 1024 * 1024 } 
     }
 
     async function request(frame, hostId, method, params, limits = {}) {
-        if (disposed || !ReadMethods.has(method) || !validHostId(hostId)
+        if (disposed || !(ReadMethods.has(method) || method === "fs/writeFile" && validWrite(params))
+            || !validHostId(hostId)
             || typeof frame?.executeJavaScript !== "function") throw new Error("Remote Daily Usage request unavailable");
         if (!limits || typeof limits !== "object" || Array.isArray(limits)
             || ["timeoutMs", "maxChars"].some(key => limits[key] !== undefined
@@ -282,15 +376,73 @@ function createRemoteTransport({ timeoutMs = 5000, maxChars = 3 * 1024 * 1024 } 
         }
     }
 
+    async function watch(frame, hostId, path, { signal } = {}) {
+        if (disposed || !validHostId(hostId) || !protocolPath(path, "responses")
+            || typeof frame?.executeJavaScript !== "function") throw new Error("Daily Usage watch unavailable");
+        if (signal !== undefined && (typeof signal?.addEventListener !== "function"
+            || typeof signal?.removeEventListener !== "function")) throw new Error("Invalid watch signal");
+        if (signal?.aborted) throw new Error("Daily Usage watch cancelled");
+        if (watches.size >= 32) throw new Error("Daily Usage watch capacity exceeded");
+        const watchId = `daily-usage-watch:${randomUUID()}`;
+        const operation = action => {
+            try {
+                return Promise.resolve(frame.executeJavaScript(`(${watchOperationInPage.toString()})`
+                    + `(${JSON.stringify(stateKey)},${JSON.stringify(watchId)},${JSON.stringify(action)})`));
+            } catch (error) { return Promise.reject(error); }
+        };
+        let stopped = false;
+        let rejectStart;
+        let cleanup;
+        let timer;
+        const entry = { dispose() {
+            if (stopped) return cleanup ?? Promise.resolve();
+            stopped = true;
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", abort);
+            watches.delete(entry);
+            rejectStart?.(new Error("Daily Usage watch cancelled"));
+            cleanup = operation("dispose").catch(() => {});
+            return cleanup;
+        } };
+        const abort = () => { void entry.dispose(); };
+        watches.add(entry);
+        signal?.addEventListener("abort", abort, { once: true });
+        const startedAtMs = Date.now();
+        const options = { stateKey, watchId, hostId, path, startedAtMs, expiresAtMs: startedAtMs + timeoutMs,
+            cancelEvent: `${cancelEvent}:watch`, maxChars: Math.min(maxChars, 64 * 1024) };
+        try {
+            await new Promise((resolve, reject) => {
+                rejectStart = reject;
+                if (signal?.aborted) { abort(); return; }
+                timer = setTimeout(() => {
+                    void entry.dispose();
+                    reject(new Error("Daily Usage watch timed out"));
+                }, timeoutMs);
+                Promise.resolve(frame.executeJavaScript(`(${watchInPage.toString()})`
+                    + `(${JSON.stringify(options)},${requestInPage.toString()})`)).then(resolve, reject);
+            });
+            clearTimeout(timer);
+            rejectStart = null;
+            if (stopped) throw new Error("Daily Usage watch cancelled");
+            return { next() {
+                return stopped ? Promise.reject(new Error("Daily Usage watch cancelled")) : operation("next");
+            }, dispose: entry.dispose };
+        } catch (error) {
+            void entry.dispose();
+            throw error;
+        }
+    }
+
     function dispose() {
         if (disposed) return;
         disposed = true;
+        for (const entry of [...watches]) void entry.dispose();
         for (const frame of new Set([...pending].map(entry => entry.frame))) cancelPage(frame);
         for (const entry of pending) entry.reject(new Error("Daily Usage disabled"));
         pending.clear();
     }
 
-    return { request, dispose };
+    return { request, watch, dispose };
 }
 
 module.exports = { createRemoteTransport };

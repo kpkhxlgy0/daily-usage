@@ -18,14 +18,14 @@ function snapshot()
         ], coverage: { files: 2, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
         pricing: { basis: 'standard', asOf: '2026-11-16' } };
 }
-async function setup(t, getReport)
+async function setup(t, getReport, extra = {})
 {
     const dom = new JSDOM('<!doctype html><div id="root"></div>');
     const root = dom.window.document.getElementById('root');
     const stop = mountPanel(root, {
         getHosts: async () => [{ hostId: 'local', label: '本机' }, { hostId: 'remote-1', label: '远程一' }],
         getReport: getReport || (async () => ({ status: 'ok', snapshot: snapshot() })), now: () => now,
-        pollMs: 100000
+        ...extra
     });
     t.after(() => { stop(); dom.window.close(); });
     await tick(); await tick();
@@ -42,6 +42,64 @@ test('filters calendar dates and exposes unpriced requests instead of showing th
     assert.equal(root.querySelectorAll('tbody tr').length, 2);
     assert.match(root.querySelector('[data-coverage]').textContent, /1.*未定价/);
     assert.match(root.querySelector('tbody tr:last-child').textContent, /未定价/);
+});
+
+test('one query per open or explicit refresh, with no polling timers', async t =>
+{
+    const dom = new JSDOM('<!doctype html><main id="page"></main>');
+    const root = dom.window.document.getElementById('page');
+    dom.window.setInterval = () => { throw new Error('Periodic polling is forbidden'); };
+    let queries = 0;
+    const stop = mountPanel(root, { getHosts: async () => [{ hostId: 'local', label: '本机' }],
+        getReport: async () => { queries++; return { status: 'ok', snapshot: snapshot() }; }, now: () => now });
+    t.after(() => { stop(); dom.window.close(); });
+    await tick(); await tick();
+    assert.equal(queries, 1);
+    const range = root.querySelector('[aria-label="统计时间范围"]');
+    range.value = '7'; range.dispatchEvent(new dom.window.Event('change'));
+    await tick();
+    assert.equal(queries, 1, 'Range changes filter the current report');
+    root.querySelector('[data-refresh]').click();
+    await tick();
+    assert.equal(queries, 2);
+});
+
+test('hiding retained settings content cancels immediately and re-opening starts a new query', async t =>
+{
+    const calls = [];
+    const cancelled = [];
+    const { root, dom } = await setup(t, (hostId, options) => new Promise(resolve =>
+        calls.push({ hostId, options, resolve })), { cancelReport: id => { cancelled.push(id); } });
+    root.style.display = 'none';
+    await tick();
+    assert.deepEqual(cancelled, [calls[0].options.requestId]);
+    calls[0].resolve({ status: 'ok', snapshot: snapshot() });
+    await tick();
+    assert.equal(root.querySelectorAll('tbody tr').length, 0);
+    root.style.display = '';
+    await tick();
+    assert.equal(calls.length, 2);
+    assert.notEqual(calls[1].options.requestId, calls[0].options.requestId);
+    root.remove();
+    await tick();
+    assert.equal(cancelled.length, 2);
+    calls[1].resolve({ status: 'ok', snapshot: snapshot() });
+    await tick();
+    assert.equal(dom.window.document.querySelectorAll('.daily-usage-panel').length, 0);
+});
+
+test('hidden window cancels active remote query and ignores late results', async t =>
+{
+    const cancelled = [];
+    const calls = [];
+    const { root, dom } = await setup(t, (hostId, options) => new Promise(resolve => calls.push({ options, resolve })),
+        { cancelReport: id => cancelled.push(id) });
+    Object.defineProperty(dom.window.document, 'visibilityState', { value: 'hidden', configurable: true });
+    dom.window.document.dispatchEvent(new dom.window.Event('visibilitychange'));
+    assert.deepEqual(cancelled, [calls[0].options.requestId]);
+    calls[0].resolve({ status: 'ok', snapshot: snapshot() });
+    await tick();
+    assert.equal(root.querySelectorAll('tbody tr').length, 0);
 });
 
 test('old host response cannot overwrite newly selected machine and teardown removes content', async t =>
@@ -123,4 +181,47 @@ test('keeps the settings page and never creates a main-sidebar clone', async t =
     assert.equal(pageDisposed, true);
     assert.equal(doc.querySelectorAll('.daily-usage-panel').length, 0);
     assert.equal(nativeRail.outerHTML, before);
+});
+
+test('conversation identity discovery follows changes rather than a background interval', async t =>
+{
+    const dom = new JSDOM('<!doctype html><div data-codex-composer-root data-conversation-id="one"><p>message</p></div>');
+    dom.window.setInterval = () => { throw new Error('Background polling is forbidden'); };
+    const calls = [];
+    const controller = startRenderer({
+        ipc: { invoke: async method => { calls.push(method); } }, log: { info() {} },
+        settings: { registerPage: () => ({ unregister() {} }) }
+    }, { window: dom.window, document: dom.window.document });
+    t.after(() => { controller.stop(); dom.window.close(); });
+    await tick();
+    assert.deepEqual(calls, ['discover']);
+    const composer = dom.window.document.querySelector('[data-codex-composer-root]');
+    composer.querySelector('p').textContent = 'streaming text';
+    await tick();
+    assert.deepEqual(calls, ['discover']);
+    composer.dataset.conversationId = 'two';
+    await tick();
+    assert.deepEqual(calls, ['discover', 'discover']);
+    controller.stop();
+    composer.dataset.conversationId = 'three';
+    await tick();
+    assert.equal(calls.length, 2);
+});
+
+test('conversation navigation during identity discovery is not lost', async t =>
+{
+    const dom = new JSDOM('<!doctype html><div data-codex-composer-root data-conversation-id="one"></div>');
+    const pending = [];
+    const controller = startRenderer({
+        ipc: { invoke: () => new Promise(resolve => pending.push(resolve)) }, log: { info() {} },
+        settings: { registerPage: () => ({ unregister() {} }) }
+    }, { window: dom.window, document: dom.window.document });
+    t.after(() => { controller.stop(); dom.window.close(); });
+    await tick();
+    dom.window.document.querySelector('[data-codex-composer-root]').dataset.conversationId = 'two';
+    await tick();
+    pending[0]();
+    await tick();
+    assert.equal(pending.length, 2);
+    pending[1]();
 });
