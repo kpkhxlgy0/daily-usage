@@ -1,5 +1,6 @@
 'use strict';
 
+const PageIconSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#142b3b"/><rect x="6.5" y="8" width="19" height="18" rx="3" fill="none" stroke="#e6f3f5" stroke-width="1.8"/><path d="M11 6v4m10-4v4M7 13h18" fill="none" stroke="#e6f3f5" stroke-width="1.8" stroke-linecap="round"/><path d="M11 22v-3m5 3v-5m5 5v-7" fill="none" stroke="#65e3c4" stroke-width="2.6" stroke-linecap="round"/></svg>';
 const DayMs = 86400000;
 const counts = new Intl.NumberFormat('zh-CN');
 const dollars = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD',
@@ -265,7 +266,7 @@ function startRenderer(api, { window: win = window, document: doc = document } =
         return cleanup;
     }
     const page = api.settings?.registerPage({ id: 'daily-usage', title: 'Daily Usage',
-        description: '每日 Token 与 API 等值费用', render: mount });
+        description: '每日 Token 与 API 等值费用', iconSvg: PageIconSvg, render: mount });
     let discovering = false;
     let rediscover = false;
     let queued = false;
