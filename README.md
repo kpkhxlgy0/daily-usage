@@ -3,15 +3,15 @@
 独立的 Codex++ tweak，按北京时间查看今天、最近 7 天、最近 30 天的 Token 和 API 等值美元。
 包含本机及本窗口打开过的 Remote Control 机器，按日期和模型拆分。
 远程机器优先显示 Codex 中的连接名称；离线保留上次名称，未识别名称时显示连接 ID。
-版本 0.1.5；最低 Codex++ 1.0.10。无需启用 Session Stats，也不会修改它。
+版本 0.1.6；最低 Codex++ 1.0.10。无需启用 Session Stats，也不会修改它。
 
 ## 安装和使用
 
 推荐在 **Codex++ Settings → Tweak Store** 搜索 **Daily Usage** 并安装。
 运行时无 npm 依赖，安装后打开 Codex 设置中的 Daily Usage 页面。
 
-也可以从 [GitHub Release v0.1.5](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.5)
-下载 `daily-usage-0.1.5.zip`，解压到长期保留的目录。
+也可以从 [GitHub Release v0.1.6](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.6)
+下载 `daily-usage-0.1.6.zip`，解压到长期保留的目录。
 Windows 已安装 Codex++ 时，在解压目录运行：
 
 ```powershell
@@ -109,7 +109,7 @@ CLI 输出 JSON；默认缓存写到所选 CODEX_HOME 的 `.daily-usage/cache`�
 只读原日志，但会写自己的统计缓存。
 
 源码：[kpkhxlgy0/daily-usage](https://github.com/kpkhxlgy0/daily-usage)。
-版本：[v0.1.5](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.5)。
+版本：[v0.1.6](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.6)。
 本机功能及原生压缩日志已验证；按需协议已通过双端文件系统自动化测试，
 0.1.3 的真实双机 Remote Control 通知与取消链路尚待安装更新后验证。
 

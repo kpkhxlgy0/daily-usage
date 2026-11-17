@@ -295,8 +295,11 @@ for (const code of ['EPERM', 'EBUSY'])
             }
         });
         calls[0].resolve({ status: 'ok', snapshot: report() });
-        const result = await waitFor(() => response(paths, marker.requestId), value => value.status !== 'running');
+        // 同步读取在返回前释放句柄，避免测试自身给重命名重试额外制造文件占用。
+        const result = await waitFor(() => JSON.parse(nativeFs.readFileSync(resultFile, 'utf8')),
+            value => value.status !== 'running');
         assert.equal(result.status, 'ok', JSON.stringify({ attempts, renameErrors, result }));
+        assert.equal(attempts, 2);
         assert.equal((await fs.readdir(paths.responses)).some(name => name.endsWith('.tmp')), false);
     });
 }
