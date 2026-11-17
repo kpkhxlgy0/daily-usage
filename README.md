@@ -1,18 +1,18 @@
 # Daily Usage
 
-独立的 Codex++ tweak，按北京时间查看今天、最近 7 天、最近 30 天的 Token 和 API 等值美元。
+独立的 Codex++ tweak，按北京时间查看今天、最近 7 天、最近 30 天的 Token 和费用估算（USD）。
 包含本机及本窗口打开过的 Remote Control 机器，按日期和模型拆分。
 本机显示“本机”；只有一台远程机器时显示“远程”，多台时优先显示 Codex 中的连接名称。
 离线保留上次名称，未识别名称时显示连接 ID。
-版本 0.1.8；最低 Codex++ 1.0.10。无需启用 Session Stats，也不会修改它。
+版本 0.1.9；最低 Codex++ 1.0.10。无需启用 Session Stats，也不会修改它。
 
 ## 安装和使用
 
 推荐在 **Codex++ Settings → Tweak Store** 搜索 **Daily Usage** 并安装。
 运行时无 npm 依赖，安装后打开 Codex 设置中的 Daily Usage 页面。
 
-也可以从 [GitHub Release v0.1.8](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.8)
-下载 `daily-usage-0.1.8.zip`，解压到长期保留的目录。
+也可以从 [GitHub Release v0.1.9](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.9)
+下载 `daily-usage-0.1.9.zip`，解压到长期保留的目录。
 Windows 已安装 Codex++ 时，在解压目录运行：
 
 ```powershell
@@ -30,7 +30,7 @@ pwsh -File .\Inject-CodexPlusPlus.ps1
 机器选择默认本机。要查看远程机器，先在本窗口打开该机器上的一条普通会话，
 再打开 Daily Usage。机器识别由会话和导航事件触发，没有定时检查。
 多台远程机器时用连接名称或连接 ID 区分，不保证是操作系统机器名。
-查看端和运行端都必须安装并启用 Daily Usage 0.1.8 或更新版本，使用一致的基础单价计价口径，且 Codex 应用需要运行。
+查看端和运行端都必须安装并启用 Daily Usage 0.1.9 或更新版本，使用一致的基础单价计价口径，且 Codex 应用需要运行。
 0.1.3 以前的运行端仍使用旧的后台更新机制，需在那台机器上更新后才会停止。
 只有查看端安装时无法获得远程机器统计；这里不会自动安装远程组件。
 
@@ -50,19 +50,21 @@ Store 安装副本只会禁用，不删除。脚本使用 `CODEX_PLUSPLUS_HOME`�
 - 使用逐响应的实际用量，按 `response_id` 跨日志去重；原生子代理单独扫描后并入总量。
 - 费用统计保留已经发生、后来被回退或移出上下文的请求。复制到分叉、归档或压缩副本的同一请求只计一次。
 - 旧日志缺少响应 ID 时使用保守累计增量，显示“估算”。无法明确归属的前缀、混用旧新格式、损坏或缺失日志会显示覆盖缺口。
-- 未知模型、缓存写入保留时间缺失等情况保留 token，并显示未定价请求。美元为能够定价部分的合计。
+- 未知模型等无法定价的情况保留 token，并显示未定价请求。费用估算（USD）为能够定价部分的合计。
 - 只反映此机器当前 CODEX_HOME 保留的日志；不能恢复已删除、未同步的云端或另一台机器的数据。
 - 多台机器分别查看，第一版不把多台机器直接相加，避免跨机器复制日志造成重复计费。
 
-## API 等值价格
+## 费用估算（USD）
 
-采用 **2026-11-16 的公开 Standard API 基础单价**，按模型及 Token 类别折算，不叠加长上下文加价。
-这是按基础单价计算的参考金额，不是历史 API 发票复原或 Codex 订阅账单；也不包含 API 实际可能收取的长上下文附加费。
+采用 **2026-11-16 的公开 Standard API 基础单价**，按模型及 Token 类别折算，不叠加长上下文或缓存写入 TTL 加价。
+这是按基础单价计算的参考金额，不是历史 API 发票复原或 Codex 订阅账单，也不代表订阅额度的消耗权重。
 日志未完整记录服务档位，因此不声称计算了实际 Fast、Flex、Ultrafast 或企业合同费用。
 历史日期也使用这张价格表；更新价格表需更新 tweak。
 
 已核实模型：GPT-6 Astra、GPT-6.1 Sol/Terra、GPT-6 Luna/Sol、GPT-5.6 Sol/Terra/Luna、GPT-5.5、GPT-5.4。
-未知 ID 不猜测为相似模型；缓存写入不能重复按普通输入计费。超过 272,000 输入 token 时也使用相同基础单价。
+未知 ID 不猜测为相似模型。普通输入和缓存写入均按普通输入基础价计一次，缓存读取按缓存读取价计算；
+缓存写入缺少 TTL 时也使用此口径。普通输入、缓存读取和缓存写入的 Token 分栏保持独立、不重叠。
+超过 272,000 输入 token 时也使用相同基础单价。
 不含图像生成、搜索等工具单独费用，也不含区域溢价、税费或折扣。
 
 来源：[官方价格表](https://developers.openai.com/api/docs/pricing)、
@@ -74,7 +76,8 @@ Store 安装副本只会禁用，不删除。脚本使用 `CODEX_PLUSPLUS_HOME`�
 支持 JSONL 和原生 Zstd 压缩历史。压缩读取需要运行时 Node >=22.15 的原生 Zstd；不支持时报告覆盖缺口。
 解析在 worker 中完成，复用没有变化的文件缓存，不将原始聊天正文写进缓存。
 每次按需查询都会使用当前基础单价重新计算，无需清空解析缓存；升级不会自动启动扫描。
-旧版含长上下文加价的金额快照不会作为新版结果显示，远程旧口径会提示更新运行端。
+旧版含长上下文或 TTL 加价的金额快照不会作为新版结果显示，远程旧口径会提示两端更新至 0.1.9；
+原始 Token 解析缓存继续复用。
 
 运行端写入 `$CODEX_HOME/.daily-usage/machine.json` 和 `summary.json`，
 并使用同目录的 `capabilities.json`、`requests/` 和 `responses/` 处理按需查询。
@@ -111,7 +114,7 @@ CLI 输出 JSON；默认缓存写到所选 CODEX_HOME 的 `.daily-usage/cache`�
 只读原日志，但会写自己的统计缓存。
 
 源码：[kpkhxlgy0/daily-usage](https://github.com/kpkhxlgy0/daily-usage)。
-版本：[v0.1.8](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.8)。
+版本：[v0.1.9](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.9)。
 本机功能及原生压缩日志已验证；按需协议已通过双端文件系统自动化测试，
 0.1.3 的真实双机 Remote Control 通知与取消链路尚待安装更新后验证。
 

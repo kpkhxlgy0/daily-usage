@@ -7,6 +7,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { EventEmitter } = require('node:events');
 const { Worker } = require('node:worker_threads');
+const { createCollector } = require('../src/collector.cjs');
 const { createService } = require('../src/service.cjs');
 
 function body()
@@ -14,7 +15,7 @@ function body()
     return { generatedAt: Date.parse('2026-11-16T12:00:00Z'), timezone: 'Asia/Shanghai',
         from: '2026-10-18', to: '2026-11-16', rows: [],
         coverage: { files: 1, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: 'standard-base-api', asOf: '2026-11-16', source: 'https://developers.openai.com/api/docs/pricing' } };
+        pricing: { basis: 'codex-base-estimate', asOf: '2026-11-16', source: 'https://developers.openai.com/api/docs/pricing' } };
 }
 
 async function setup(t)
@@ -92,7 +93,8 @@ test('startup and idle never create a collector; each query awaits a fresh termi
     assert.equal(next.getState().status, 'stale');
 });
 
-test('startup rejects legacy pricing without scanning and fresh demand recomputes the base-price report', async t =>
+for (const basis of ['standard', 'standard-base-api'])
+test(`startup rejects ${basis} pricing without scanning and demand reprices the same raw cache`, async t =>
 {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'daily-usage-pricing-migration-'));
     const directory = path.join(root, '.daily-usage');
@@ -101,12 +103,12 @@ test('startup rejects legacy pricing without scanning and fresh demand recompute
     const timestamp = new Date().toISOString();
     const date = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric',
         month: '2-digit', day: '2-digit' }).format(new Date(timestamp));
-    const row = { date, model: 'gpt-5.4', requests: 1, inputTokens: 300000,
-        uncachedInputTokens: 100000, cachedInputTokens: 200000, cacheWriteTokens: 0, outputTokens: 10000,
-        usd: 0.825, unpricedRequests: 0, estimatedRequests: 0 };
+    const row = { date, model: 'gpt-6.1-sol', requests: 1, inputTokens: 300000,
+        uncachedInputTokens: 200000, cachedInputTokens: 0, cacheWriteTokens: 100000, outputTokens: 1000,
+        usd: 0.66, unpricedRequests: 0, estimatedRequests: 0 };
     const legacy = { ...body(), schemaVersion: 1, source: 'com.kpk.daily-usage', machineId,
         publisherId: '33333333-3333-4333-8333-333333333333', revision: 7, from: date, to: date, rows: [row],
-        pricing: { ...body().pricing, basis: 'standard' } };
+        pricing: { ...body().pricing, basis } };
     const original = JSON.stringify(legacy);
     await fs.mkdir(directory);
     await fs.writeFile(path.join(directory, 'machine.json'), JSON.stringify({ machineId }));
@@ -114,13 +116,21 @@ test('startup rejects legacy pricing without scanning and fresh demand recompute
     await fs.mkdir(path.join(root, 'sessions'));
     const records = [
         { timestamp, type: 'session_meta', payload: { id: machineId } },
-        { timestamp, type: 'turn_context', payload: { turn_id: 'turn-1', model: 'gpt-5.4' } },
+        { timestamp, type: 'turn_context', payload: { turn_id: 'turn-1', model: 'gpt-6.1-sol' } },
         { timestamp, type: 'token_usage_record', payload: { response_id: 'response-1', thread_id: machineId,
-            turn_id: 'turn-1', usage: { input_tokens: 300000, cached_input_tokens: 200000,
-                cache_write_input_tokens: 0, output_tokens: 10000, total_tokens: 310000 } } }
+            turn_id: 'turn-1', usage: { input_tokens: 300000, cached_input_tokens: 0,
+                cache_write_input_tokens: 100000, cache_write_ttl: '30m',
+                output_tokens: 1000, total_tokens: 301000 } } }
     ];
     await fs.writeFile(path.join(root, 'sessions', 'migration.jsonl'),
         records.map(record => JSON.stringify(record)).join('\n') + '\n');
+    const seed = createCollector({ codexHome: root, cacheDir: path.join(root, 'data/cache') });
+    try { await seed.scan(); }
+    finally { await seed.dispose(); }
+    const cacheDirectory = path.join(root, 'data/cache/usage-cache');
+    const [cacheName] = await fs.readdir(cacheDirectory);
+    const cacheFile = path.join(cacheDirectory, cacheName);
+    const rawCache = await fs.readFile(cacheFile, 'utf8');
     const workers = [];
     const service = createService({ codexHome: root, dataDir: path.join(root, 'data'), workerFactory: options =>
     {
@@ -135,13 +145,16 @@ test('startup rejects legacy pricing without scanning and fresh demand recompute
     assert.equal(service.getState().status, 'unavailable');
     assert.equal(service.getState().snapshot, undefined);
     assert.equal(await fs.readFile(summary, 'utf8'), original);
-    await assert.rejects(fs.access(path.join(root, 'data/cache')), { code: 'ENOENT' });
+    assert.equal(await fs.readFile(cacheFile, 'utf8'), rawCache);
     const state = await service.query();
     assert.equal(state.status, 'ok', JSON.stringify(state));
     assert.equal(workers.length, 1);
     assert.equal(state.snapshot.machineId, machineId);
-    assert.equal(state.snapshot.pricing.basis, 'standard-base-api');
-    assert.deepEqual(state.snapshot.rows, [{ ...row, usd: 0.45 }]);
+    assert.equal(state.snapshot.pricing.basis, 'codex-base-estimate');
+    assert.deepEqual(state.snapshot.rows, [{ ...row, usd: 0.61 }]);
+    assert.equal(state.snapshot.coverage.cachedFiles, 1);
+    assert.equal(state.snapshot.coverage.parsedFiles, 0);
+    assert.equal(await fs.readFile(cacheFile, 'utf8'), rawCache);
     assert.deepEqual(JSON.parse(await fs.readFile(summary, 'utf8')), state.snapshot);
     const publishedAt = (await fs.stat(summary)).mtimeMs;
     await new Promise(resolve => setTimeout(resolve, 40));

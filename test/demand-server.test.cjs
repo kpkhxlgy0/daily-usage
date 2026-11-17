@@ -16,7 +16,7 @@ function report()
     return { schemaVersion: 1, source: 'com.kpk.daily-usage', machineId: randomUUID(), publisherId: randomUUID(),
         revision: 1, generatedAt: Date.now(), timezone: 'Asia/Shanghai', from: '2026-10-18', to: '2026-11-17',
         rows: [], coverage: { files: 0, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: 'standard-base-api', asOf: '2026-11-16', source: 'https://developers.openai.com/api/docs/pricing' } };
+        pricing: { basis: 'codex-base-estimate', asOf: '2026-11-16', source: 'https://developers.openai.com/api/docs/pricing' } };
 }
 
 async function setup(t, options = {})

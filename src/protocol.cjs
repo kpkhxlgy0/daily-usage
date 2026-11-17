@@ -62,12 +62,12 @@ function validateSnapshot(value, options = {}) {
         || Object.keys(coverage).some(key => key !== "warnings"
             && (!/^[a-z][a-zA-Z0-9]{0,63}$/.test(key) || !integer(coverage[key])))) return invalid("invalid");
     if (!exactKeys(value.pricing, ["basis", "asOf", "source"])
-        || !["standard-base-api", "standard"].includes(value.pricing.basis)
+        || !["codex-base-estimate", "standard-base-api", "standard"].includes(value.pricing.basis)
         || value.pricing.asOf !== "2026-11-16" || !concise(value.pricing.source, 512)) return invalid("invalid");
     try {
         if (Buffer.byteLength(JSON.stringify(value), "utf8") > MaxSnapshotBytes) return invalid("size");
     } catch { return invalid("invalid"); }
-    if (value.pricing.basis === "standard") return invalid("update-required");
+    if (value.pricing.basis !== "codex-base-estimate") return invalid("update-required");
     return { ok: true };
 }
 

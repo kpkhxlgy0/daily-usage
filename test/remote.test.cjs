@@ -23,7 +23,7 @@ function sample(overrides = {}) {
         publisherId: PublisherId, revision: 1, generatedAt: Now, timezone: "Asia/Shanghai",
         from: "2026-10-18", to: "2026-11-16", rows: [],
         coverage: { files: 2, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: "standard-base-api", asOf: "2026-11-16", source: "https://openai.com/api/pricing/" }, ...overrides };
+        pricing: { basis: "codex-base-estimate", asOf: "2026-11-16", source: "https://openai.com/api/pricing/" }, ...overrides };
 }
 
 const Requests = `${Directory}/requests`;
@@ -139,15 +139,17 @@ test("offline preserves the original cached report, is host isolated and never e
     assert.equal((await f.get({ hostId: "remote-control:other", threadId: ThreadId })).snapshot, undefined);
 });
 
-test("legacy pricing responses require an update and never become an accepted remote cache", async t => {
+for (const basis of ["standard", "standard-base-api"])
+test(`${basis} pricing responses require an update and never become an accepted remote cache`, async t => {
     const f = fixture(t);
-    f.value = sample({ pricing: { ...sample().pricing, basis: "standard" } });
+    f.value = sample({ pricing: { ...sample().pricing, basis } });
     assert.deepEqual(await f.get(), { status: "unavailable", error: "snapshot-update-required" });
     f.offline = true;
     assert.deepEqual(await f.get(), { status: "unavailable", error: "snapshot-unavailable" });
 });
 
-test("legacy pricing responses preserve only a previously accepted base-price report as stale", async t => {
+for (const basis of ["standard", "standard-base-api"])
+test(`${basis} pricing responses preserve only a previously accepted estimate as stale`, async t => {
     const f = fixture(t);
     f.value.rows = [{ date: "2026-11-16", model: "gpt-5.4", requests: 1, inputTokens: 300000,
         uncachedInputTokens: 100000, cachedInputTokens: 200000, cacheWriteTokens: 0, outputTokens: 10000,
@@ -156,7 +158,7 @@ test("legacy pricing responses preserve only a previously accepted base-price re
     assert.equal(first.status, "ok");
     const accepted = first.snapshot;
     f.value = { ...accepted, revision: 2, generatedAt: Now + 1,
-        rows: [{ ...accepted.rows[0], usd: 0.825 }], pricing: { ...accepted.pricing, basis: "standard" } };
+        rows: [{ ...accepted.rows[0], usd: 0.825 }], pricing: { ...accepted.pricing, basis } };
     const result = await f.get();
     assert.equal(result.status, "stale");
     assert.equal(result.error, "snapshot-update-required");

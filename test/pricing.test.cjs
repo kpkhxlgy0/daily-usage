@@ -16,7 +16,7 @@ test('cached input is charged separately and reasoning output is not added twice
     assert.equal(price.uncachedInputTokens, 800);
     assert.equal(price.usd, 0.00262);
     assert.equal(price.unpriced, false);
-    assert.equal(Pricing.basis, 'standard-base-api');
+    assert.equal(Pricing.basis, 'codex-base-estimate');
     assert.equal(Pricing.asOf, '2026-11-16');
 });
 
@@ -43,31 +43,43 @@ test('all verified Standard models use their own input, cached and output prices
     for (const [model, want] of cases) assert.equal(priceRequest(request({ model })).usd, want, model);
 });
 
-test('explicit 30 minute and 12 hour cache writes replace ordinary input pricing', () =>
+test('cache writes use ordinary input rates once regardless of TTL and retain distinct counters', () =>
 {
-    assert.equal(priceRequest(request({ cacheWriteTokens: 100, cacheWriteTtl: '30m' })).usd, 0.00267);
-    assert.equal(priceRequest(request({ cacheWriteTokens: 100, cacheWriteTtl: '12h' })).usd, 0.00292);
-    assert.equal(priceRequest(request({ inputTokens: 300000, cachedInputTokens: 0,
-        cacheWriteTokens: 100000, cacheWriteTtl: '30m', outputTokens: 1000 })).usd, 0.66);
+    for (const cacheWriteTtl of ['30m', '12h', undefined])
+    {
+        const price = priceRequest(request({ cacheWriteTokens: 100, cacheWriteTtl }));
+        assert.equal(price.usd, 0.00262, cacheWriteTtl);
+        assert.equal(price.uncachedInputTokens, 700);
+        assert.equal(price.unpriced, false);
+        assert.deepEqual(price.reasons, []);
+    }
 });
 
-test('missing write TTL preserves priced subtotal and marks the request unpriced', () =>
+test('large cache writes keep ordinary base input rates without long-context or TTL premiums', () =>
 {
-    const price = priceRequest(request({ cacheWriteTokens: 100 }));
-    assert.equal(price.usd, 0.00242);
-    assert.equal(price.unpriced, true);
-    assert.ok(price.reasons.includes('cache-write-ttl'));
+    for (const cacheWriteTtl of ['30m', '12h', undefined])
+    {
+        const price = priceRequest(request({ inputTokens: 300000, cachedInputTokens: 0,
+            cacheWriteTokens: 100000, cacheWriteTtl, outputTokens: 1000 }));
+        assert.equal(price.usd, 0.61);
+        assert.equal(price.uncachedInputTokens, 200000);
+        assert.equal(price.unpriced, false);
+    }
 });
 
-test('unknown models and unsupported cache writes are visible rather than assumed free', () =>
+test('known older models price cache writes as ordinary input while unknown models remain unpriced', () =>
 {
-    const unknown = priceRequest(request({ model: 'custom-private-model' }));
+    for (const [model, want] of [['gpt-5.5', 0.0071], ['gpt-5.4', 0.00355]])
+    {
+        const price = priceRequest(request({ model, cacheWriteTokens: 100 }));
+        assert.equal(price.usd, want, model);
+        assert.equal(price.uncachedInputTokens, 700);
+        assert.equal(price.unpriced, false);
+    }
+    const unknown = priceRequest(request({ model: 'custom-private-model', cacheWriteTokens: 100 }));
     assert.equal(unknown.usd, 0);
     assert.equal(unknown.unpriced, true);
-    const unsupported = priceRequest(request({ model: 'gpt-5.5', cacheWriteTokens: 100,
-        cacheWriteTtl: '30m' }));
-    assert.equal(unsupported.usd, 0.0066);
-    assert.equal(unsupported.unpriced, true);
+    assert.equal(unknown.uncachedInputTokens, 700);
 });
 
 test('invalid overlapping or noninteger token counts never yield a negative or invented price', () =>

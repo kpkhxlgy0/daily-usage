@@ -85,7 +85,7 @@ test('modern paid requests survive discarded context and deduplicate globally ac
         inputTokens: 3000, uncachedInputTokens: 2400, cachedInputTokens: 600, cacheWriteTokens: 0,
         outputTokens: 300, usd: 0.00786, unpricedRequests: 0, estimatedRequests: 0 });
     assert.equal(report.coverage.duplicateRequests, 1);
-    assert.equal(report.pricing.basis, 'standard-base-api');
+    assert.equal(report.pricing.basis, 'codex-base-estimate');
 });
 
 test('sanitized native usage and paired token_count count once with no false coverage gap', async t =>
@@ -136,7 +136,7 @@ test('unchanged parsed usage caches are reused and long requests are repriced at
     assert.equal(report.coverage.parsedFiles, 0);
     assert.equal(report.rows[0].inputTokens, 300000);
     assert.equal(report.rows[0].usd, 0.53);
-    assert.equal(report.pricing.basis, 'standard-base-api');
+    assert.equal(report.pricing.basis, 'codex-base-estimate');
 });
 
 test('models resolve by matching turn rather than last context and child session_id is not source identity', async t =>
@@ -421,16 +421,16 @@ test('native child legacy sources remain independent despite sharing the root se
     assert.equal(report.rows[0].inputTokens, 300);
 });
 
-test('unknown cache write TTL retains token category and priced subtotal', async t =>
+test('missing cache write TTL keeps distinct token categories and prices input once', async t =>
 {
     const f = await fixture(t);
     await f.write('sessions/write.jsonl', [meta('root'), context('turn-1'), modern('write', { write: 100 })]);
     const report = await f.collector().scan();
     assert.equal(report.rows[0].uncachedInputTokens, 700);
     assert.equal(report.rows[0].cacheWriteTokens, 100);
-    assert.equal(report.rows[0].usd, 0.00242);
-    assert.equal(report.rows[0].unpricedRequests, 1);
-    assert.match(report.coverage.warnings.join(' '), /未定价/);
+    assert.equal(report.rows[0].usd, 0.00262);
+    assert.equal(report.rows[0].unpricedRequests, 0);
+    assert.deepEqual(report.coverage.warnings, []);
 });
 
 test('persistent per-file metadata cache avoids reparsing, refreshes on append, and never saves chat text', async t =>

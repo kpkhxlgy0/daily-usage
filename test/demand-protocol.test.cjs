@@ -14,7 +14,7 @@ const snapshot = { schemaVersion: 1, source: "com.kpk.daily-usage",
     machineId: "22222222-2222-4222-8222-222222222222", publisherId: Publisher, revision: 1,
     generatedAt: Now, timezone: "Asia/Shanghai", from: "2026-10-18", to: "2026-11-16", rows: [],
     coverage: { files: 0, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-    pricing: { basis: "standard-base-api", asOf: "2026-11-16", source: "https://openai.com/api/pricing/" } };
+    pricing: { basis: "codex-base-estimate", asOf: "2026-11-16", source: "https://openai.com/api/pricing/" } };
 
 test("markers use a bounded lifetime and cancellation preserves the query identity and timestamps", () => {
     assert.deepEqual(makeMarker(Id, Now), marker);
@@ -62,9 +62,10 @@ test("capabilities and results bind to one endpoint and validate snapshots befor
         status: "error", error: "scan-failed" }, options).ok, true);
 });
 
-test("successful demand responses propagate the legacy pricing update requirement", () => {
+for (const basis of ["standard", "standard-base-api"])
+test(`successful demand responses propagate the ${basis} pricing update requirement`, () => {
     const value = { ...base, requestId: Id, publisherId: Publisher, updatedAt: Now, status: "ok",
-        snapshot: { ...snapshot, pricing: { ...snapshot.pricing, basis: "standard" } } };
+        snapshot: { ...snapshot, pricing: { ...snapshot.pricing, basis } } };
     assert.deepEqual(validateResult(value, { requestId: Id, publisherId: Publisher, now: Now }),
         { ok: false, reason: "update-required" });
 });
