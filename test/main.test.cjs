@@ -6,10 +6,10 @@ const { createMain } = require('../src/main.cjs');
 const QueryA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const QueryB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 
-function harness(t, service, remote)
+function harness(t, service, remote, options = {})
 {
     const handlers = new Map();
-    const registry = new Map();
+    const registry = new Map([['knownHosts', options.knownHosts || []]]);
     const sender = new EventEmitter();
     const frame = { executeJavaScript: async () => [{ bound: { hostId: 'rc:test',
         threadId: '11111111-1111-4111-8111-111111111111' } }] };
@@ -21,11 +21,12 @@ function harness(t, service, remote)
         serviceFactory: () => ({ ready: Promise.resolve(), dispose: async () => {}, ...service }),
         demandFactory: () => ({ ready: Promise.resolve(), dispose: async () => {} }),
         remoteFactory: () => ({ get: async () => ({ status: 'ok' }), dispose: async () => {}, ...remote }),
-        transportFactory: () => ({ request() {}, watch() {}, dispose() {} }), bindingScript: 'binding-test'
+        transportFactory: () => ({ request() {}, watch() {}, dispose() {} }), bindingScript: 'binding-test',
+        windowServices: options.windowServices
     });
     t.after(() => main.stop());
     const call = (method,arg,from=event) => handlers.get('codexpp:com.kpk.daily-usage:'+method)(from,arg);
-    return { call,main,sender,event,handlers };
+    return { call,main,sender,event,handlers,registry,frame };
 }
 
 function pendingQueries()
@@ -92,6 +93,50 @@ test('remote demand receives native watcher and page cancellation signal', async
     assert.equal(received.identity.hostId,'rc:test');
     assert.equal(typeof received.options.watch,'function');
     assert.equal(received.options.signal.aborted,false);
+});
+
+test('host list reads native display names on demand and preserves routing when renamed', async t =>
+{
+    let reads = 0;
+    let displayName = '办公室电脑';
+    let routed;
+    const h = harness(t, {}, { get: async identity => { routed = identity; return { status: 'ok' }; } }, {
+        windowServices: { getContextForWebContents(sender)
+        {
+            assert.equal(sender, h.sender);
+            return { remoteConnectionCatalog: { read()
+            {
+                reads++;
+                return { ssh: [{ hostId: 'another-host', displayName: '其他机器' }],
+                    remoteControl: [{ hostId: 'rc:test', displayName }] };
+            } } };
+        } }
+    });
+    await h.call('discover');
+    assert.equal(reads, 0);
+    assert.deepEqual((await h.call('hosts'))[1], { hostId: 'rc:test', label: '远程 · 办公室电脑' });
+    displayName = '  工作电脑  ';
+    assert.equal((await h.call('hosts'))[1].label, '远程 · 工作电脑');
+    assert.equal(h.registry.get('knownHosts')[0].displayName, '工作电脑');
+    await h.call('report', { hostId: 'rc:test', requestId: QueryA });
+    assert.equal(routed.hostId, 'rc:test');
+    assert.equal(reads, 2);
+});
+
+test('host names survive rediscovery and unavailable catalogs, with IDs for unknown names', async t =>
+{
+    const h = harness(t, {}, {}, { knownHosts: [
+        { hostId: 'rc:test', threadId: '11111111-1111-4111-8111-111111111111', displayName: '已知电脑' },
+        { hostId: 'rc:unnamed', threadId: '22222222-2222-4222-8222-222222222222', displayName: '\u0000bad' }
+    ], windowServices: { getContextForWebContents() { throw new Error('unavailable'); } } });
+    h.frame.executeJavaScript = async () => [{ bound: { hostId: 'rc:test',
+        threadId: '33333333-3333-4333-8333-333333333333' } }];
+    await h.call('discover');
+    assert.deepEqual((await h.call('hosts')).slice(1), [
+        { hostId: 'rc:test', label: '远程 · 已知电脑' },
+        { hostId: 'rc:unnamed', label: '远程 · rc:unnamed' }
+    ]);
+    assert.equal(h.registry.get('knownHosts')[0].threadId, '33333333-3333-4333-8333-333333333333');
 });
 
 test('leaving before initialization completes does not start a late scan', async t =>

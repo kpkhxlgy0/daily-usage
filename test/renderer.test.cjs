@@ -64,6 +64,31 @@ test('one query per open or explicit refresh, with no polling timers', async t =
     assert.equal(queries, 2);
 });
 
+test('reopening updates remote names without changing the selected connection', async t =>
+{
+    let label = '远程 · 办公室电脑';
+    const queries = [];
+    const { root, dom } = await setup(t, async hostId =>
+    {
+        queries.push(hostId);
+        return { status: 'ok', snapshot: snapshot() };
+    }, { getHosts: async () => [{ hostId: 'remote-1', label }] });
+    const host = root.querySelector('[aria-label="统计机器"]');
+    host.value = 'remote-1';
+    host.dispatchEvent(new dom.window.Event('change'));
+    await tick();
+    root.hidden = true;
+    await tick();
+    label = '远程 · 工作电脑';
+    root.hidden = false;
+    await tick(); await tick();
+    assert.equal(host.value, 'remote-1');
+    assert.equal(host.selectedOptions[0].textContent, label);
+    assert.equal(host.options.length, 2);
+    assert.match(root.querySelector('[data-status]').textContent, /工作电脑/);
+    assert.deepEqual(queries, ['local', 'remote-1', 'remote-1']);
+});
+
 test('hiding retained settings content cancels immediately and re-opening starts a new query', async t =>
 {
     const calls = [];

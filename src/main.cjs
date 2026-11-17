@@ -5,6 +5,8 @@ const path = require('node:path');
 const Uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const validHost = value => typeof value === 'string' && value.length > 0 && value.length <= 512
     && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+const hostName = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 256
+    && !/[\u0000-\u001f\u007f-\u009f]/.test(value) ? value.trim() : undefined;
 
 function createMain(api, dependencies = {})
 {
@@ -28,7 +30,8 @@ function createMain(api, dependencies = {})
         for (const entry of persisted)
         {
             if (validHost(entry?.hostId) && entry.hostId !== 'local' && Uuid.test(entry.threadId))
-                hosts.set(entry.hostId, { hostId: entry.hostId, threadId: entry.threadId });
+                hosts.set(entry.hostId, { hostId: entry.hostId, threadId: entry.threadId,
+                    displayName: hostName(entry.displayName) });
         }
     }
     let stopped = false;
@@ -83,8 +86,33 @@ function createMain(api, dependencies = {})
         channels.push(channel);
     }
 
-    register('hosts', () => [{ hostId: 'local', label: `本机 · ${os.hostname()}` },
-        ...[...hosts.values()].map(entry => ({ hostId: entry.hostId, label: `远程 · ${entry.hostId}` }))]);
+    register('hosts', event =>
+    {
+        try
+        {
+            // 仅在页面请求机器列表时读取原生内存快照，不刷新连接或订阅后台变化。
+            const services = dependencies.windowServices || globalThis.__codexpp_window_services__;
+            const catalog = services?.getContextForWebContents?.(event.sender)?.remoteConnectionCatalog?.read?.();
+            let changed = false;
+            for (const group of [catalog?.ssh, catalog?.wsl, catalog?.remoteControl])
+            {
+                if (!Array.isArray(group)) continue;
+                for (const connection of group)
+                {
+                    const entry = hosts.get(connection?.hostId);
+                    const displayName = hostName(connection?.displayName);
+                    if (!entry || !displayName || entry.displayName === displayName) continue;
+                    entry.displayName = displayName;
+                    changed = true;
+                }
+            }
+            if (changed) api.storage.set('knownHosts', [...hosts.values()]);
+        }
+        catch { /* 原生目录不可用时保留上次名称；未识别过的连接使用 ID。 */ }
+        return [{ hostId: 'local', label: `本机 · ${os.hostname()}` },
+            ...[...hosts.values()].map(entry => ({ hostId: entry.hostId,
+                label: `远程 · ${entry.displayName || entry.hostId}` }))];
+    });
     register('discover', event =>
     {
         const frame = event.senderFrame;
@@ -97,7 +125,7 @@ function createMain(api, dependencies = {})
             {
                 if (!bound || !validHost(bound.hostId) || bound.hostId === 'local' || !Uuid.test(bound.threadId)) continue;
                 if (hosts.get(bound.hostId)?.threadId === bound.threadId) continue;
-                hosts.set(bound.hostId, { hostId: bound.hostId, threadId: bound.threadId });
+                hosts.set(bound.hostId, { ...hosts.get(bound.hostId), hostId: bound.hostId, threadId: bound.threadId });
                 changed = true;
             }
             if (changed) api.storage.set('knownHosts', [...hosts.values()]);

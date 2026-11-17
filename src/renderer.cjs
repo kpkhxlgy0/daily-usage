@@ -197,13 +197,15 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
             if (!alive || !visibleElement(panel)) return;
             for (const entry of hosts)
             {
-                if (hostNames.has(entry.hostId)) continue;
-                hostNames.set(entry.hostId, entry.label || entry.hostId);
-                const option = doc.createElement('option');
+                const label = entry.label || entry.hostId;
+                hostNames.set(entry.hostId, label);
+                const option = [...host.options].find(value => value.value === entry.hostId)
+                    || doc.createElement('option');
                 option.value = entry.hostId;
-                option.textContent = entry.label || entry.hostId;
-                host.append(option);
+                option.textContent = label;
+                if (!option.parentElement) host.append(option);
             }
+            render();
         }
         catch { /* 主进程重载期间保留已经确认的机器列表。 */ }
     }
