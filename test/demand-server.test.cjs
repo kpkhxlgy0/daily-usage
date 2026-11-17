@@ -96,7 +96,11 @@ test('native watcher advertises ready then runs exactly one query per fresh mark
     await waitFor(() => Promise.resolve(calls.length), count => count === 1);
     assert.equal((await response(paths, marker.requestId)).status, 'running');
     calls[0].resolve({ status: 'ok', snapshot: report() });
-    const result = await waitFor(() => response(paths, marker.requestId), value => value.status === 'ok');
+    // Release the test reader's handle before the publisher replaces the running response on Windows.
+    const resultFile = path.join(paths.responses, `${marker.requestId}.json`);
+    const result = await waitFor(() => JSON.parse(nativeFs.readFileSync(resultFile, 'utf8')),
+        value => value.status !== 'running');
+    assert.equal(result.status, 'ok', JSON.stringify(result));
     assert.equal(validateResult(result, { requestId: marker.requestId,
         publisherId: capabilities.publisherId }).ok, true);
     await write(paths, marker);
