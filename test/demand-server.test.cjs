@@ -81,7 +81,8 @@ async function waitFor(read, predicate = Boolean)
     assert.fail('Timed out waiting for filesystem observation');
 }
 
-const response = (paths, id) => fs.readFile(path.join(paths.responses, `${id}.json`), 'utf8').then(JSON.parse);
+// Close the observer's handle before the publisher can replace a response on Windows.
+const response = (paths, id) => JSON.parse(nativeFs.readFileSync(path.join(paths.responses, `${id}.json`), 'utf8'));
 
 test('native watcher advertises ready then runs exactly one query per fresh marker and leaves idle unchanged', async t =>
 {
@@ -96,10 +97,7 @@ test('native watcher advertises ready then runs exactly one query per fresh mark
     await waitFor(() => Promise.resolve(calls.length), count => count === 1);
     assert.equal((await response(paths, marker.requestId)).status, 'running');
     calls[0].resolve({ status: 'ok', snapshot: report() });
-    // Release the test reader's handle before the publisher replaces the running response on Windows.
-    const resultFile = path.join(paths.responses, `${marker.requestId}.json`);
-    const result = await waitFor(() => JSON.parse(nativeFs.readFileSync(resultFile, 'utf8')),
-        value => value.status !== 'running');
+    const result = await waitFor(() => response(paths, marker.requestId), value => value.status !== 'running');
     assert.equal(result.status, 'ok', JSON.stringify(result));
     assert.equal(validateResult(result, { requestId: marker.requestId,
         publisherId: capabilities.publisherId }).ok, true);
@@ -208,13 +206,17 @@ test('cancellation during asynchronous response preparation suppresses successfu
     });
     t.mock.method(fs, 'rename', async (from, to) =>
     {
-        if (to === resultFile) commits.push(JSON.parse(await fs.readFile(from, 'utf8')).status);
-        return rename(from, to);
+        if (to !== resultFile) return rename(from, to);
+        const status = JSON.parse(await fs.readFile(from, 'utf8')).status;
+        await rename(from, to);
+        commits.push(status);
     });
     t.mock.method(nativeFs, 'renameSync', (from, to) =>
     {
-        if (to === resultFile) commits.push(JSON.parse(nativeFs.readFileSync(from, 'utf8')).status);
-        return renameSync(from, to);
+        if (to !== resultFile) return renameSync(from, to);
+        const status = JSON.parse(nativeFs.readFileSync(from, 'utf8')).status;
+        renameSync(from, to);
+        commits.push(status);
     });
     calls[0].resolve({ status: 'ok', snapshot: report() });
     try
