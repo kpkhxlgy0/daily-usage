@@ -109,9 +109,9 @@ function createMain(api, dependencies = {})
             if (changed) api.storage.set('knownHosts', [...hosts.values()]);
         }
         catch { /* 原生目录不可用时保留上次名称；未识别过的连接使用 ID。 */ }
-        return [{ hostId: 'local', label: `本机 · ${os.hostname()}` },
+        return [{ hostId: 'local', label: '本机' },
             ...[...hosts.values()].map(entry => ({ hostId: entry.hostId,
-                label: `远程 · ${entry.displayName || entry.hostId}` }))];
+                label: hosts.size === 1 ? '远程' : `远程 · ${entry.displayName || entry.hostId}` }))];
     });
     register('discover', event =>
     {

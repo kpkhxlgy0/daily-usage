@@ -49,6 +49,7 @@ test('main starts no report scan and only accepted visible-page requests invoke 
     const service=pendingQueries();
     const h=harness(t,service);
     assert.equal(service.calls.length,0);
+    assert.deepEqual(await h.call('hosts'), [{ hostId: 'local', label: '本机' }]);
     assert.equal((await h.call('report',{hostId:'local',path:'secret',requestId:QueryA})).status,'unavailable');
     const promise=h.call('report',{hostId:'local',requestId:QueryA});
     await new Promise(resolve=>setImmediate(resolve));
@@ -89,6 +90,10 @@ test('remote demand receives native watcher and page cancellation signal', async
     }});
     assert.equal((await h.call('report',{hostId:'rc:test',requestId:QueryA})).status,'unavailable');
     await h.call('discover');
+    assert.deepEqual(await h.call('hosts'), [
+        { hostId: 'local', label: '本机' },
+        { hostId: 'rc:test', label: '远程' }
+    ]);
     assert.equal((await h.call('report',{hostId:'rc:test',requestId:QueryB})).status,'ok');
     assert.equal(received.identity.hostId,'rc:test');
     assert.equal(typeof received.options.watch,'function');
@@ -101,6 +106,10 @@ test('host list reads native display names on demand and preserves routing when 
     let displayName = '办公室电脑';
     let routed;
     const h = harness(t, {}, { get: async identity => { routed = identity; return { status: 'ok' }; } }, {
+        knownHosts: [
+            { hostId: 'rc:test', threadId: '11111111-1111-4111-8111-111111111111' },
+            { hostId: 'another-host', threadId: '22222222-2222-4222-8222-222222222222' }
+        ],
         windowServices: { getContextForWebContents(sender)
         {
             assert.equal(sender, h.sender);
