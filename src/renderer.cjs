@@ -107,7 +107,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         }
         const stale = snapshot && (state === 'stale' || state === 'error' || now() - snapshot.generatedAt > 180000);
         status.textContent = reportState?.error === 'snapshot-update-required'
-            ? '远端计价口径或按需协议需要更新，请确认两端均已启用 Daily Usage 0.1.9 或更新版本，且 Codex 支持文件通知。'
+            ? '请在查看端和运行端安装并启用同一新版 Daily Usage，并确认 Codex 支持文件通知。'
             : state === 'loading' ? '正在查询所选机器，完成后显示结果…'
             : stale ? '显示最后成功的缓存数据；当前连接不可用或统计尚未更新。'
             : snapshot ? `${hostNames.get(host.value) || host.value} · 统计已更新`

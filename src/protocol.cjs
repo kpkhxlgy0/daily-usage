@@ -1,6 +1,7 @@
 "use strict";
 
 const path = require("node:path");
+const { Pricing } = require("./pricing.cjs");
 
 const MaxSnapshotBytes = 2 * 1024 * 1024;
 const StaleAfterMs = 3 * 60 * 1000;
@@ -62,12 +63,16 @@ function validateSnapshot(value, options = {}) {
         || Object.keys(coverage).some(key => key !== "warnings"
             && (!/^[a-z][a-zA-Z0-9]{0,63}$/.test(key) || !integer(coverage[key])))) return invalid("invalid");
     if (!exactKeys(value.pricing, ["basis", "asOf", "source"])
-        || !["codex-base-estimate", "standard-base-api", "standard"].includes(value.pricing.basis)
-        || value.pricing.asOf !== "2026-11-16" || !concise(value.pricing.source, 512)) return invalid("invalid");
+        || !concise(value.pricing.source, 512)) return invalid("invalid");
+    const { basis, asOf } = value.pricing;
+    const currentPricing = basis === Pricing.basis && asOf === Pricing.asOf;
+    const priorPricing = asOf === "2026-11-16"
+        && ["codex-base-estimate", "standard-base-api", "standard"].includes(basis);
+    if (!currentPricing && !priorPricing) return invalid("invalid");
     try {
         if (Buffer.byteLength(JSON.stringify(value), "utf8") > MaxSnapshotBytes) return invalid("size");
     } catch { return invalid("invalid"); }
-    if (value.pricing.basis !== "codex-base-estimate") return invalid("update-required");
+    if (!currentPricing) return invalid("update-required");
     return { ok: true };
 }
 

@@ -1,11 +1,13 @@
 'use strict';
 
-const Pricing = Object.freeze({ basis: 'codex-base-estimate', asOf: '2026-11-16',
+const Pricing = Object.freeze({ basis: 'codex-base-estimate', asOf: '2026-11-18',
     source: 'https://developers.openai.com/api/docs/pricing.md' });
 const Million = 1000000;
 
-// Standard 基础单价于 2026-11-16 核验；每百万 token 计价，不叠加长上下文或 TTL 倍率。
+// Standard USD per million tokens: input, output, cached input.
 const Rates = new Map([
+    ['gpt-6.2-astra', [8, 40, 0.4]],
+    ['gpt-6.2-sol', [2, 10, 0.1]],
     ['gpt-6-astra', [10, 50, 1]],
     ['gpt-6.1-sol', [2, 10, 0.1]],
     ['gpt-6.1-terra', [1, 5, 0.05]],

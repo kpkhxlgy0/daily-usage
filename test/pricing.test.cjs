@@ -17,7 +17,7 @@ test('cached input is charged separately and reasoning output is not added twice
     assert.equal(price.usd, 0.00262);
     assert.equal(price.unpriced, false);
     assert.equal(Pricing.basis, 'codex-base-estimate');
-    assert.equal(Pricing.asOf, '2026-11-16');
+    assert.equal(Pricing.asOf, '2026-11-18');
 });
 
 test('crossing 272000 input tokens keeps the same base input, cache and output rates', () =>
@@ -35,6 +35,7 @@ test('crossing 272000 input tokens keeps the same base input, cache and output r
 test('all verified Standard models use their own input, cached and output prices', () =>
 {
     const cases = [
+        ['gpt-6.2-astra', 0.01048], ['gpt-6.2-sol', 0.00262],
         ['gpt-6-astra', 0.0132], ['gpt-6.1-sol', 0.00262], ['gpt-6.1-terra', 0.00131],
         ['gpt-6-luna', 0.000132], ['gpt-6-sol', 0.00264], ['gpt-5.6-sol', 0.00528],
         ['gpt-5.6-terra', 0.00284], ['gpt-5.6-luna', 0.000284],

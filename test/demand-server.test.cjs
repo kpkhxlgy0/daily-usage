@@ -7,6 +7,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { randomUUID } = require('node:crypto');
 const { spawnSync } = require('node:child_process');
+const { Pricing } = require('../src/pricing.cjs');
 const { createDemandServer } = require('../src/demand-server.cjs');
 const { demandPaths, makeMarker, validateCapabilities, validateResult } = require('../src/demand-protocol.cjs');
 const { createService } = require('../src/service.cjs');
@@ -16,7 +17,7 @@ function report()
     return { schemaVersion: 1, source: 'com.kpk.daily-usage', machineId: randomUUID(), publisherId: randomUUID(),
         revision: 1, generatedAt: Date.now(), timezone: 'Asia/Shanghai', from: '2026-10-18', to: '2026-11-17',
         rows: [], coverage: { files: 0, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: 'codex-base-estimate', asOf: '2026-11-16', source: 'https://developers.openai.com/api/docs/pricing' } };
+        pricing: { ...Pricing } };
 }
 
 async function setup(t, options = {})

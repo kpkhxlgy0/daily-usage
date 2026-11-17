@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("node:path");
+const { Pricing } = require("../src/pricing.cjs");
 const { demandPaths, makeMarker, validateMarker, validateCapabilities, validateResult,
     MaxDemandBytes, MaxResultBytes, MaxDemandMs } = require("../src/demand-protocol.cjs");
 const Id = "11111111-1111-4111-8111-111111111111";
@@ -14,7 +15,7 @@ const snapshot = { schemaVersion: 1, source: "com.kpk.daily-usage",
     machineId: "22222222-2222-4222-8222-222222222222", publisherId: Publisher, revision: 1,
     generatedAt: Now, timezone: "Asia/Shanghai", from: "2026-10-18", to: "2026-11-16", rows: [],
     coverage: { files: 0, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-    pricing: { basis: "codex-base-estimate", asOf: "2026-11-16", source: "https://openai.com/api/pricing/" } };
+    pricing: { ...Pricing } };
 
 test("markers use a bounded lifetime and cancellation preserves the query identity and timestamps", () => {
     assert.deepEqual(makeMarker(Id, Now), marker);
@@ -62,10 +63,10 @@ test("capabilities and results bind to one endpoint and validate snapshots befor
         status: "error", error: "scan-failed" }, options).ok, true);
 });
 
-for (const basis of ["standard", "standard-base-api"])
+for (const basis of ["standard", "standard-base-api", "codex-base-estimate"])
 test(`successful demand responses propagate the ${basis} pricing update requirement`, () => {
     const value = { ...base, requestId: Id, publisherId: Publisher, updatedAt: Now, status: "ok",
-        snapshot: { ...snapshot, pricing: { ...snapshot.pricing, basis } } };
+        snapshot: { ...snapshot, pricing: { ...snapshot.pricing, basis, asOf: "2026-11-16" } } };
     assert.deepEqual(validateResult(value, { requestId: Id, publisherId: Publisher, now: Now }),
         { ok: false, reason: "update-required" });
 });

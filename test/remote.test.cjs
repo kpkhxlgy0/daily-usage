@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const vm = require("node:vm");
+const { Pricing } = require("../src/pricing.cjs");
 const { createRemoteStore } = require("../src/remote-store.cjs");
 const { createRemoteTransport } = require("../src/vendor/remote-transport.cjs");
 const { bindingScript } = require("../src/vendor/binding.cjs");
@@ -23,12 +24,13 @@ function sample(overrides = {}) {
         publisherId: PublisherId, revision: 1, generatedAt: Now, timezone: "Asia/Shanghai",
         from: "2026-10-18", to: "2026-11-16", rows: [],
         coverage: { files: 2, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: "codex-base-estimate", asOf: "2026-11-16", source: "https://openai.com/api/pricing/" }, ...overrides };
+        pricing: { ...Pricing }, ...overrides };
 }
 
 const Requests = `${Directory}/requests`;
 const Responses = `${Directory}/responses`;
 const Capabilities = `${Directory}/capabilities.json`;
+const PriorPricingBases = ["standard", "standard-base-api", "codex-base-estimate"];
 const Base = { schemaVersion: 1, source: "com.kpk.daily-usage", demandVersion: 1 };
 
 function fixture(t) {
@@ -139,17 +141,17 @@ test("offline preserves the original cached report, is host isolated and never e
     assert.equal((await f.get({ hostId: "remote-control:other", threadId: ThreadId })).snapshot, undefined);
 });
 
-for (const basis of ["standard", "standard-base-api"])
-test(`${basis} pricing responses require an update and never become an accepted remote cache`, async t => {
+for (const basis of PriorPricingBases)
+test(`${basis} November 16 pricing responses require an update and never become an accepted remote cache`, async t => {
     const f = fixture(t);
-    f.value = sample({ pricing: { ...sample().pricing, basis } });
+    f.value = sample({ pricing: { ...sample().pricing, basis, asOf: "2026-11-16" } });
     assert.deepEqual(await f.get(), { status: "unavailable", error: "snapshot-update-required" });
     f.offline = true;
     assert.deepEqual(await f.get(), { status: "unavailable", error: "snapshot-unavailable" });
 });
 
-for (const basis of ["standard", "standard-base-api"])
-test(`${basis} pricing responses preserve only a previously accepted estimate as stale`, async t => {
+for (const basis of PriorPricingBases)
+test(`${basis} November 16 pricing responses preserve only a previously accepted estimate as stale`, async t => {
     const f = fixture(t);
     f.value.rows = [{ date: "2026-11-16", model: "gpt-5.4", requests: 1, inputTokens: 300000,
         uncachedInputTokens: 100000, cachedInputTokens: 200000, cacheWriteTokens: 0, outputTokens: 10000,
@@ -158,7 +160,7 @@ test(`${basis} pricing responses preserve only a previously accepted estimate as
     assert.equal(first.status, "ok");
     const accepted = first.snapshot;
     f.value = { ...accepted, revision: 2, generatedAt: Now + 1,
-        rows: [{ ...accepted.rows[0], usd: 0.825 }], pricing: { ...accepted.pricing, basis } };
+        rows: [{ ...accepted.rows[0], usd: 0.825 }], pricing: { ...accepted.pricing, basis, asOf: "2026-11-16" } };
     const result = await f.get();
     assert.equal(result.status, "stale");
     assert.equal(result.error, "snapshot-update-required");

@@ -7,6 +7,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { EventEmitter } = require('node:events');
 const { Worker } = require('node:worker_threads');
+const { Pricing } = require('../src/pricing.cjs');
 const { createCollector } = require('../src/collector.cjs');
 const { createService } = require('../src/service.cjs');
 
@@ -15,7 +16,7 @@ function body()
     return { generatedAt: Date.parse('2026-11-16T12:00:00Z'), timezone: 'Asia/Shanghai',
         from: '2026-10-18', to: '2026-11-16', rows: [],
         coverage: { files: 1, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: 'codex-base-estimate', asOf: '2026-11-16', source: 'https://developers.openai.com/api/docs/pricing' } };
+        pricing: { ...Pricing } };
 }
 
 async function setup(t)
@@ -93,7 +94,7 @@ test('startup and idle never create a collector; each query awaits a fresh termi
     assert.equal(next.getState().status, 'stale');
 });
 
-for (const basis of ['standard', 'standard-base-api'])
+for (const basis of ['standard', 'standard-base-api', 'codex-base-estimate'])
 test(`startup rejects ${basis} pricing without scanning and demand reprices the same raw cache`, async t =>
 {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'daily-usage-pricing-migration-'));
@@ -108,7 +109,7 @@ test(`startup rejects ${basis} pricing without scanning and demand reprices the 
         usd: 0.66, unpricedRequests: 0, estimatedRequests: 0 };
     const legacy = { ...body(), schemaVersion: 1, source: 'com.kpk.daily-usage', machineId,
         publisherId: '33333333-3333-4333-8333-333333333333', revision: 7, from: date, to: date, rows: [row],
-        pricing: { ...body().pricing, basis } };
+        pricing: { ...body().pricing, basis, asOf: '2026-11-16' } };
     const original = JSON.stringify(legacy);
     await fs.mkdir(directory);
     await fs.writeFile(path.join(directory, 'machine.json'), JSON.stringify({ machineId }));

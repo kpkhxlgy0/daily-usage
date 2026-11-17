@@ -2,6 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { JSDOM } = require('jsdom');
+const { Pricing } = require('../src/pricing.cjs');
 const { mountPanel, startRenderer } = require('../src/renderer.cjs');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const now = Date.parse('2026-11-16T12:00:00Z');
@@ -16,7 +17,7 @@ function snapshot()
                 uncachedInputTokens: 100, cachedInputTokens: 0, cacheWriteTokens: 0,
                 outputTokens: 10, usd: 0, unpricedRequests: 1, estimatedRequests: 0 }
         ], coverage: { files: 2, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: 'codex-base-estimate', asOf: '2026-11-16' } };
+        pricing: { ...Pricing } };
 }
 async function setup(t, getReport, extra = {})
 {
@@ -156,7 +157,7 @@ test('offline cached report keeps its timestamp and is labeled stale', async t =
 test('legacy pricing is shown as an update requirement without an old dollar total', async t =>
 {
     const { root } = await setup(t, async () => ({ status: 'unavailable', error: 'snapshot-update-required' }));
-    assert.match(root.querySelector('[data-status]').textContent, /0\.1\.9/);
+    assert.match(root.querySelector('[data-status]').textContent, /查看端和运行端.*Daily Usage.*文件通知/);
     assert.equal(root.querySelector('[data-summary="usd"]').textContent, '—');
     assert.match(root.textContent, /基础单价.*不.*长上下文.*缓存保留时长.*订阅账单/);
 });

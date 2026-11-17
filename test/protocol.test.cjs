@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { Pricing } = require("../src/pricing.cjs");
 const { validateSnapshot, snapshotContext, MaxSnapshotBytes } = require("../src/protocol.cjs");
 
 const ThreadId = "11111111-1111-4111-8111-111111111111";
@@ -16,7 +17,7 @@ function snapshot(overrides = {}) {
             uncachedInputTokens: 70, cachedInputTokens: 20, cacheWriteTokens: 10, outputTokens: 30,
             usd: 0.001, unpricedRequests: 1, estimatedRequests: 0 }],
         coverage: { files: 2, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: "codex-base-estimate", asOf: "2026-11-16", source: "https://openai.com/api/pricing/" },
+        pricing: { ...Pricing, source: "https://openai.com/api/pricing/" },
         ...overrides };
 }
 
@@ -37,8 +38,8 @@ test("stale snapshots remain valid while untrusted future snapshots are rejected
 });
 
 test("known prior pricing snapshots require an update only after structure and size validation", () => {
-    for (const basis of ["standard", "standard-base-api"]) {
-        const legacy = snapshot({ pricing: { ...snapshot().pricing, basis } });
+    for (const basis of ["standard", "standard-base-api", "codex-base-estimate"]) {
+        const legacy = snapshot({ pricing: { ...snapshot().pricing, basis, asOf: "2026-11-16" } });
         assert.deepEqual(validateSnapshot(legacy, { now: Now }), { ok: false, reason: "update-required" });
         assert.deepEqual(validateSnapshot(snapshot({ pricing: { ...legacy.pricing, basis: "subscription" } }),
             { now: Now }), { ok: false, reason: "invalid" });
@@ -57,6 +58,8 @@ test("rejects unknown schemas, identities, unsafe counters, and payload fields",
         { publisherId: `${snapshot().publisherId}\n` }, { revision: 0 }, { revision: 1.2 },
         { generatedAt: NaN }, { timezone: "UTC" }, { from: "2026-02-30" }, { from: "2026-11-17" },
         { to: "2026-13-01" }, { rows: null }, { messages: ["private"] },
+        { pricing: { ...snapshot().pricing, asOf: "2026-02-30" } },
+        { pricing: { ...snapshot().pricing, basis: "standard" } },
         { pricing: { ...snapshot().pricing, basis: "subscription" } }]) {
         assert.equal(validateSnapshot(snapshot(change), { now: Now }).ok, false, JSON.stringify(change));
     }
