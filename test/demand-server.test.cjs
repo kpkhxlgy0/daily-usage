@@ -277,18 +277,26 @@ for (const code of ['EPERM', 'EBUSY'])
         const resultFile = path.join(paths.responses, `${marker.requestId}.json`);
         const renameSync = nativeFs.renameSync;
         let locked = true;
+        let attempts = 0;
+        const renameErrors = [];
         t.mock.method(nativeFs, 'renameSync', (from, to) =>
         {
+            if (to === resultFile) attempts++;
             if (to === resultFile && locked)
             {
                 locked = false;
                 throw Object.assign(new Error('sharing-violation'), { code });
             }
-            return renameSync(from, to);
+            try { return renameSync(from, to); }
+            catch (error)
+            {
+                if (to === resultFile) renameErrors.push({ code: error.code, message: error.message });
+                throw error;
+            }
         });
         calls[0].resolve({ status: 'ok', snapshot: report() });
         const result = await waitFor(() => response(paths, marker.requestId), value => value.status !== 'running');
-        assert.equal(result.status, 'ok');
+        assert.equal(result.status, 'ok', JSON.stringify({ attempts, renameErrors, result }));
         assert.equal((await fs.readdir(paths.responses)).some(name => name.endsWith('.tmp')), false);
     });
 }
