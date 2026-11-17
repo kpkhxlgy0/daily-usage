@@ -67,7 +67,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
     <header><h2>Daily Usage</h2><select aria-label="统计机器"><option value="local">本机</option></select>
     <select aria-label="统计时间范围"><option value="1">今天</option><option value="7">最近 7 天</option>
     <option value="30">最近 30 天</option></select><button type="button" data-refresh>刷新</button></header>
-    <p>北京时间 · 包含子代理 · 按公开 Standard API 价格折算，计入长上下文费率；金额不代表订阅账单。</p>
+    <p>北京时间 · 包含子代理 · 按公开 Standard API 基础单价折算，不叠加长上下文加价；金额不代表订阅账单。</p>
     <div data-status role="status" aria-live="polite">正在读取统计…</div>
     <div class="daily-usage-cards">
         <div class="daily-usage-card"><small>Token 总量</small><strong data-summary="tokens">—</strong></div>
@@ -107,7 +107,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         }
         const stale = snapshot && (state === 'stale' || state === 'error' || now() - snapshot.generatedAt > 180000);
         status.textContent = reportState?.error === 'snapshot-update-required'
-            ? '远端暂不支持按需查询，请确认两端均已启用 Daily Usage 0.1.3 或更新版本，且 Codex 支持文件通知。'
+            ? '远端计价口径或按需协议需要更新，请确认两端均已启用 Daily Usage 0.1.8 或更新版本，且 Codex 支持文件通知。'
             : state === 'loading' ? '正在查询所选机器，完成后显示结果…'
             : stale ? '显示最后成功的缓存数据；当前连接不可用或统计尚未更新。'
             : snapshot ? `${hostNames.get(host.value) || host.value} · 统计已更新`

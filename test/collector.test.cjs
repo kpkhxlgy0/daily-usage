@@ -85,7 +85,7 @@ test('modern paid requests survive discarded context and deduplicate globally ac
         inputTokens: 3000, uncachedInputTokens: 2400, cachedInputTokens: 600, cacheWriteTokens: 0,
         outputTokens: 300, usd: 0.00786, unpricedRequests: 0, estimatedRequests: 0 });
     assert.equal(report.coverage.duplicateRequests, 1);
-    assert.equal(report.pricing.basis, 'standard');
+    assert.equal(report.pricing.basis, 'standard-base-api');
 });
 
 test('sanitized native usage and paired token_count count once with no false coverage gap', async t =>
@@ -121,6 +121,22 @@ test('pre-native-parser schema cache is invalidated rather than returning stale 
     const report = await f.collector().scan();
     assert.equal(report.rows[0].requests, 1);
     assert.equal(report.coverage.parsedFiles, 1);
+});
+
+test('unchanged parsed usage caches are reused and long requests are repriced at base rates', async t =>
+{
+    const f = await fixture(t);
+    await f.write('sessions/long-context.jsonl', [meta('root'), context('turn-1', 'gpt-6-astra'),
+        modern('long-request', { input: 300000, cached: 280000, output: 1000 })]);
+    const first = f.collector();
+    await first.scan();
+    await first.dispose();
+    const report = await f.collector().scan();
+    assert.equal(report.coverage.cachedFiles, 1);
+    assert.equal(report.coverage.parsedFiles, 0);
+    assert.equal(report.rows[0].inputTokens, 300000);
+    assert.equal(report.rows[0].usd, 0.53);
+    assert.equal(report.pricing.basis, 'standard-base-api');
 });
 
 test('models resolve by matching turn rather than last context and child session_id is not source identity', async t =>

@@ -16,7 +16,7 @@ function snapshot()
                 uncachedInputTokens: 100, cachedInputTokens: 0, cacheWriteTokens: 0,
                 outputTokens: 10, usd: 0, unpricedRequests: 1, estimatedRequests: 0 }
         ], coverage: { files: 2, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: 'standard', asOf: '2026-11-16' } };
+        pricing: { basis: 'standard-base-api', asOf: '2026-11-16' } };
 }
 async function setup(t, getReport, extra = {})
 {
@@ -149,6 +149,14 @@ test('offline cached report keeps its timestamp and is labeled stale', async t =
     const { root } = await setup(t, async () => ({ status: 'stale', snapshot: snapshot(), error: 'offline' }));
     assert.match(root.querySelector('[data-status]').textContent, /离线|旧数据|缓存/);
     assert.match(root.querySelector('[data-updated]').textContent, /2026/);
+});
+
+test('legacy pricing is shown as an update requirement without an old dollar total', async t =>
+{
+    const { root } = await setup(t, async () => ({ status: 'unavailable', error: 'snapshot-update-required' }));
+    assert.match(root.querySelector('[data-status]').textContent, /0\.1\.8/);
+    assert.equal(root.querySelector('[data-summary="usd"]').textContent, '—');
+    assert.match(root.textContent, /基础单价.*不.*长上下文/);
 });
 
 test('partially priced request retains known dollar subtotal with missing-price label', async t =>

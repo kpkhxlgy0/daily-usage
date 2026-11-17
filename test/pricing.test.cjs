@@ -16,16 +16,20 @@ test('cached input is charged separately and reasoning output is not added twice
     assert.equal(price.uncachedInputTokens, 800);
     assert.equal(price.usd, 0.00262);
     assert.equal(price.unpriced, false);
-    assert.equal(Pricing.basis, 'standard');
+    assert.equal(Pricing.basis, 'standard-base-api');
     assert.equal(Pricing.asOf, '2026-11-16');
 });
 
-test('the exact 272000 input boundary is short context and the next token changes all request rates', () =>
+test('crossing 272000 input tokens keeps the same base input, cache and output rates', () =>
 {
     assert.equal(priceRequest(request({ inputTokens: 272000, cachedInputTokens: 72000,
         outputTokens: 1000 })).usd, 0.4172);
     assert.equal(priceRequest(request({ inputTokens: 272001, cachedInputTokens: 72000,
-        outputTokens: 1000 })).usd, 0.829404);
+        outputTokens: 1000 })).usd, 0.417202);
+    assert.equal(priceRequest(request({ model: 'gpt-6-astra', inputTokens: 300000,
+        cachedInputTokens: 280000, outputTokens: 1000 })).usd, 0.53);
+    assert.equal(priceRequest(request({ model: 'gpt-6-astra', inputTokens: 1000000,
+        cachedInputTokens: 900000, outputTokens: 1000 })).usd, 1.95);
 });
 
 test('all verified Standard models use their own input, cached and output prices', () =>
@@ -44,7 +48,7 @@ test('explicit 30 minute and 12 hour cache writes replace ordinary input pricing
     assert.equal(priceRequest(request({ cacheWriteTokens: 100, cacheWriteTtl: '30m' })).usd, 0.00267);
     assert.equal(priceRequest(request({ cacheWriteTokens: 100, cacheWriteTtl: '12h' })).usd, 0.00292);
     assert.equal(priceRequest(request({ inputTokens: 300000, cachedInputTokens: 0,
-        cacheWriteTokens: 100000, cacheWriteTtl: '30m', outputTokens: 1000 })).usd, 1.315);
+        cacheWriteTokens: 100000, cacheWriteTtl: '30m', outputTokens: 1000 })).usd, 0.66);
 });
 
 test('missing write TTL preserves priced subtotal and marks the request unpriced', () =>

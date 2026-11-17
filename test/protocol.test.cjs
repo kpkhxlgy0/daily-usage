@@ -16,7 +16,7 @@ function snapshot(overrides = {}) {
             uncachedInputTokens: 70, cachedInputTokens: 20, cacheWriteTokens: 10, outputTokens: 30,
             usd: 0.001, unpricedRequests: 1, estimatedRequests: 0 }],
         coverage: { files: 2, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { basis: "standard", asOf: "2026-11-16", source: "https://openai.com/api/pricing/" },
+        pricing: { basis: "standard-base-api", asOf: "2026-11-16", source: "https://openai.com/api/pricing/" },
         ...overrides };
 }
 
@@ -34,6 +34,17 @@ test("stale snapshots remain valid while untrusted future snapshots are rejected
     assert.equal(validateSnapshot(snapshot({ generatedAt: Now + 5000 }), { now: Now }).ok, true);
     assert.deepEqual(validateSnapshot(snapshot({ generatedAt: Now + 5001 }), { now: Now }),
         { ok: false, reason: "future" });
+});
+
+test("legacy pricing snapshots require an update while unknown or malformed pricing remains invalid", () => {
+    const legacy = snapshot({ pricing: { ...snapshot().pricing, basis: "standard" } });
+    assert.deepEqual(validateSnapshot(legacy, { now: Now }), { ok: false, reason: "update-required" });
+    assert.deepEqual(validateSnapshot(snapshot({ pricing: { ...legacy.pricing, basis: "subscription" } }),
+        { now: Now }), { ok: false, reason: "invalid" });
+    assert.deepEqual(validateSnapshot(snapshot({ pricing: { ...legacy.pricing, asOf: "2026-11-15" } }),
+        { now: Now }), { ok: false, reason: "invalid" });
+    assert.deepEqual(validateSnapshot({ ...legacy, rows: [{ ...legacy.rows[0], inputTokens: 101 }] },
+        { now: Now }), { ok: false, reason: "invalid" });
 });
 
 test("rejects unknown schemas, identities, unsafe counters, and payload fields", () => {
