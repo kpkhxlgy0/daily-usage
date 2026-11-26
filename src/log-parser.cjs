@@ -1,6 +1,7 @@
 'use strict';
 
 const { validTokens } = require('./pricing.cjs');
+const { createWeeklyObservations } = require('./weekly-quota.cjs');
 
 const MaxRecordBytes = 1024 * 1024;
 
@@ -27,17 +28,20 @@ function normalizeUsage(value)
         || cachedInputTokens > inputTokens || cacheWriteTokens > inputTokens - cachedInputTokens) return null;
     const ttl = value.cache_write_ttl;
     const seconds = value.cache_write_ttl_seconds;
-    const cacheWriteTtl = ttl === '30m' || seconds === 1800 ? '30m'
-        : ttl === '12h' || seconds === 43200 ? '12h' : null;
+    const namedTtl = ttl === '30m' || ttl === '12h' ? ttl : null;
+    const secondsTtl = seconds === 1800 ? '30m' : seconds === 43200 ? '12h' : null;
+    let cacheWriteTtl = ttl == null ? secondsTtl : namedTtl;
+    if (ttl != null && seconds != null && namedTtl !== secondsTtl) cacheWriteTtl = null;
     return { inputTokens, outputTokens, cachedInputTokens, cacheWriteTokens, cacheWriteTtl };
 }
 
-function createLogParser({ sourceId, minTimestamp = -Infinity })
+function createLogParser({ sourceId, minTimestamp = -Infinity, maxWeeklyTimestamp = Infinity })
 {
     const contexts = new Map();
     const modern = [];
     const legacy = [];
     const modernThreads = new Set();
+    const weekly = createWeeklyObservations(minTimestamp, maxWeeklyTimestamp);
     let currentModel = 'unknown';
     let skippedRecords = 0;
     let oversizedRecords = 0;
@@ -102,6 +106,7 @@ function createLogParser({ sourceId, minTimestamp = -Infinity })
             modern.push({ id, thread, turn, timestamp, model, threadUsageKey, ...usage });
             return;
         }
+        weekly.observe(payload.rate_limits, timestamp);
         const total = normalizeUsage(payload.info && payload.info.total_token_usage);
         const last = normalizeUsage(payload.info && payload.info.last_token_usage);
         if (!total)
@@ -171,7 +176,7 @@ function createLogParser({ sourceId, minTimestamp = -Infinity })
             }
             return { sourceId, modern, legacy,
                 modernThreads: [...modernThreads].map(thread => thread || sourceId),
-                skippedRecords, oversizedRecords };
+                skippedRecords, oversizedRecords, ...weekly.finish() };
         },
     };
 }

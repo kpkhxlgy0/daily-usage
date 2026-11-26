@@ -33,6 +33,159 @@ async function setup(t, getReport, extra = {})
     return { root, dom, stop };
 }
 
+const weeklyModel = '<gpt-small>';
+function completedWeek()
+{
+    return {
+        startAt: Date.parse('2026-11-11T16:30:00Z'), startKind: 'reset',
+        fullAt: Date.parse('2026-11-15T12:00:00Z'), usedPercent: 100,
+        sampleAt: Date.parse('2026-11-15T13:00:00Z'), rows: [
+            { model: weeklyModel, requests: 2, baseUsd: 0.01, usd: 0.01, unpricedRequests: 0, estimatedRequests: 0 },
+            { model: 'unlisted-model', requests: 3, baseUsd: 23.5, usd: 0, unpricedRequests: 3, estimatedRequests: 0 },
+            { model: 'large-model', requests: 15, baseUsd: 1789.266539, usd: 1856.32499152, unpricedRequests: 0, estimatedRequests: 1 }
+        ]
+    };
+}
+
+function selectRange(root, dom, value)
+{
+    const range = root.querySelector('[aria-label="统计时间范围"]');
+    assert.ok([...range.options].some(option => option.value === value), 'The requested range is available');
+    range.value = value;
+    range.dispatchEvent(new dom.window.Event('change'));
+}
+
+test('weekly quota displays the reset-to-full window with model costs sorted by long-context estimate', async t =>
+{
+    const report = { ...snapshot(), weekly: completedWeek() };
+    report.rows[0].usd = 1.2345;
+    report.rows.push({ ...report.rows[0], date: '2026-11-01' });
+    let queries = 0;
+    const { root, dom } = await setup(t, async () =>
+    {
+        queries++;
+        return { status: 'ok', snapshot: report };
+    });
+    assert.equal(root.querySelector('[data-summary="usd"]').textContent, '$1.2345');
+    selectRange(root, dom, 'weekly');
+    const weekly = root.querySelector('[data-weekly]');
+    const table = weekly.querySelector('table[aria-label="本轮周额度模型用量"]');
+    assert.equal(table.caption?.textContent, '按模型统计');
+    const rows = [...table.tBodies[0].rows];
+    assert.equal(weekly.hidden, false);
+    assert.match(weekly.querySelector('[data-weekly-period]').textContent,
+        /重置.*11\/12 00:30.*首次满额.*11\/15 20:00/);
+    assert.match(weekly.querySelector('[data-weekly-summary="usd"]').textContent, /^\$1,856\.33(?:（|$)/);
+    assert.equal(weekly.querySelector('[data-weekly-summary="requests"]').textContent, '20');
+    assert.equal(weekly.querySelector('progress[aria-label="周额度已用"]').value, 100);
+    assert.deepEqual(rows.map(row => row.cells[0].textContent.trim()), ['large-model', weeklyModel, 'unlisted-model']);
+    assert.match(rows[0].cells[2].textContent, /^\$1,789\.27(?:（|$)/);
+    assert.match(rows[0].cells[3].textContent, /^\$1,856\.32(?:（|$)/);
+    assert.match(rows[1].cells[4].textContent, /<0\.1%/);
+    assert.ok(rows[1].cells[4].querySelector('progress').value > 0);
+    assert.equal(rows[1].querySelector('gpt-small'), null);
+    assert.equal(rows[2].cells[2].textContent, '$23.50');
+    assert.equal(rows[2].cells[3].textContent, '—');
+    assert.equal(rows[2].cells[4].textContent, '—');
+    assert.equal(rows[2].cells[4].querySelector('progress'), null);
+    assert.match(weekly.textContent, /3 次请求未定价/);
+    assert.match(weekly.textContent, /1 次请求.*估算/);
+
+    selectRange(root, dom, '7');
+    assert.equal(weekly.hidden, true);
+    assert.match(root.querySelector('table[aria-label="每日模型用量"] tbody').textContent, /2026-11-15/);
+    assert.doesNotMatch(root.querySelector('table[aria-label="每日模型用量"] tbody').textContent, /2026-11-01/);
+    selectRange(root, dom, '30');
+    assert.match(root.querySelector('table[aria-label="每日模型用量"] tbody').textContent, /2026-11-01/);
+    assert.equal(queries, 1, 'Changing between weekly and daily views reuses the report');
+});
+
+test('weekly cache from the selected remote host uses its timestamp and observed quota', async t =>
+{
+    const remote = { ...snapshot(), generatedAt: Date.parse('2026-11-14T14:43:00Z'), weekly: {
+        startAt: Date.parse('2026-11-12T15:00:00Z'), startKind: 'observed', fullAt: null,
+        usedPercent: 99.95, sampleAt: Date.parse('2026-11-14T14:30:00Z'),
+        rows: [{ model: 'remote-model', requests: 12, baseUsd: 16, usd: 0,
+            unpricedRequests: 12, estimatedRequests: 0 }]
+    } };
+    const queries = [];
+    const { root, dom } = await setup(t, async hostId =>
+    {
+        queries.push(hostId);
+        return hostId === 'local' ? { status: 'ok', snapshot: { ...snapshot(), weekly: completedWeek() } }
+            : { status: 'stale', snapshot: remote, error: 'offline' };
+    });
+    selectRange(root, dom, 'weekly');
+    const host = root.querySelector('[aria-label="统计机器"]');
+    host.value = 'remote-1';
+    host.dispatchEvent(new dom.window.Event('change'));
+    await tick();
+    const weekly = root.querySelector('[data-weekly]');
+    assert.match(root.querySelector('[data-status]').textContent, /缓存/);
+    assert.match(weekly.querySelector('[data-weekly-period]').textContent,
+        /首次观测.*11\/12 23:00.*缓存截至.*11\/14 22:43/);
+    assert.match(weekly.textContent, /部分覆盖/);
+    assert.match(weekly.textContent, /观测于.*11\/14 22:30/);
+    assert.match(weekly.querySelector('[data-weekly-summary="percent"]').textContent, />99\.9%/);
+    assert.equal(weekly.querySelector('progress[aria-label="周额度已用"]').value, 99.95);
+    assert.equal(weekly.querySelector('[data-weekly-summary="usd"]').textContent, '—');
+    assert.equal(weekly.querySelector('[data-weekly-summary="requests"]').textContent, '12');
+    assert.match(weekly.textContent, /远程一.*请求数/);
+    const remoteCells = weekly.querySelector('tbody tr').cells;
+    assert.equal(remoteCells[2].textContent, '$16.00');
+    assert.equal(remoteCells[3].textContent, '—');
+    assert.match(weekly.textContent, /12 次请求未定价/);
+    assert.doesNotMatch(weekly.textContent, /large-model|首次满额|NaN|\$0/);
+    assert.deepEqual(queries, ['local', 'remote-1']);
+});
+
+test('an inferred weekly reset with complete log coverage shows recorded zero requests and dollars', async t =>
+{
+    const report = { ...snapshot(), weekly: { ...completedWeek(), startKind: 'inferred', fullAt: null,
+        usedPercent: 0, rows: [] } };
+    const { root, dom } = await setup(t, async () => ({ status: 'ok', snapshot: report }));
+    selectRange(root, dom, 'weekly');
+    const weekly = root.querySelector('[data-weekly]');
+    assert.match(weekly.querySelector('[data-weekly-period]').textContent,
+        /按重置时间推算.*11\/12 00:30.*当前.*11\/16 20:00/);
+    assert.equal(weekly.querySelector('[data-weekly-summary="percent"]').textContent, '0%');
+    assert.equal(weekly.querySelector('[data-weekly-summary="requests"]').textContent, '0');
+    assert.equal(weekly.querySelector('[data-weekly-summary="usd"]').textContent, '$0.00');
+    assert.match(weekly.textContent, /本机可读日志范围.*没有可统计的请求/);
+    assert.equal(weekly.querySelectorAll('tbody tr').length, 0);
+});
+
+test('a weekly window with incomplete log coverage counts recorded zero without a zero-dollar estimate', async t =>
+{
+    const report = { ...snapshot(), weekly: { ...completedWeek(), rows: [] } };
+    report.coverage.failedFiles = 1;
+    const { root, dom } = await setup(t, async () => ({ status: 'ok', snapshot: report }));
+    selectRange(root, dom, 'weekly');
+    const weekly = root.querySelector('[data-weekly]');
+    assert.equal(weekly.querySelector('[data-weekly-summary="requests"]').textContent, '0');
+    assert.equal(weekly.querySelector('[data-weekly-summary="usd"]').textContent, '—');
+    assert.match(weekly.textContent, /本机可读日志范围.*覆盖缺口/);
+    assert.match(weekly.textContent, /1 个日志读取失败/);
+});
+
+test('weekly view distinguishes an older publisher from a report without quota observations', async t =>
+{
+    const report = snapshot();
+    const { root, dom } = await setup(t, async () => ({ status: 'ok', snapshot: { ...report } }));
+    selectRange(root, dom, 'weekly');
+    const weekly = root.querySelector('[data-weekly]');
+    assert.match(weekly.textContent, /更新.*Daily Usage|Daily Usage.*更新/);
+    assert.equal(weekly.querySelector('[data-weekly-summary="usd"]').textContent, '—');
+    report.weekly = null;
+    root.querySelector('[data-refresh]').click();
+    await tick();
+    assert.match(weekly.textContent, /暂无周额度观测记录/);
+    assert.doesNotMatch(weekly.textContent, /更新.*Daily Usage|Daily Usage.*更新|\$0/);
+    assert.ok(weekly.querySelector('progress[aria-label="周额度已用"]').hidden);
+    selectRange(root, dom, '1');
+    assert.match(root.querySelector('[data-summary="usd"]').textContent, /\$1\.25/);
+});
+
 test('filters calendar dates and exposes unpriced requests instead of showing them as free', async t =>
 {
     const { root, dom } = await setup(t);

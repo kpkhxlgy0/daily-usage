@@ -30,6 +30,7 @@ function sample(overrides = {}) {
 const Requests = `${Directory}/requests`;
 const Responses = `${Directory}/responses`;
 const Capabilities = `${Directory}/capabilities.json`;
+const CapabilitiesV2 = `${Directory}/capabilities-v2.json`;
 const PriorPricingBases = ["standard", "standard-base-api", "codex-base-estimate"];
 const Base = { schemaVersion: 1, source: "com.kpk.daily-usage", demandVersion: 1 };
 
@@ -50,13 +51,14 @@ function fixture(t) {
         if (method === "thread/read") return state.thread ?? { thread: { id: params.threadId, path: rollout(params.threadId) } };
         const isResult = params.path?.startsWith(`${Responses}/`);
         const isMarker = params.path?.startsWith(`${Requests}/`);
-        assert.ok([Home, Directory, Requests, Responses, Capabilities].includes(params.path) || isResult || isMarker,
+        assert.ok([Home, Directory, Requests, Responses, Capabilities, CapabilitiesV2].includes(params.path) || isResult || isMarker,
             `Unexpected path ${params.path}`);
         if (method === "fs/getMetadata") {
-            if (state.oldPeer && params.path === Capabilities || isResult && !state.results.has(params.path.split("/").at(-1).slice(0, -5))) {
+            if (state.oldPeer && params.path === Capabilities || params.path === CapabilitiesV2 && !state.weeklyPublisher
+                || isResult && !state.results.has(params.path.split("/").at(-1).slice(0, -5))) {
                 throw Object.assign(new Error("ENOENT private path"), { code: "ENOENT" });
             }
-            const isFile = params.path === Capabilities || isResult || isMarker;
+            const isFile = params.path === Capabilities || params.path === CapabilitiesV2 || isResult || isMarker;
             const info = { isFile, isDirectory: !isFile, isSymlink: false, createdAtMs: 10, modifiedAtMs: 20, size: 100 };
             return state.metadata ? state.metadata(params.path, info) : info;
         }
@@ -70,8 +72,8 @@ function fixture(t) {
             return {};
         }
         assert.equal(method, "fs/readFile");
-        if (params.path === Capabilities) return { dataBase64: Buffer.from(JSON.stringify({ ...Base,
-            publisherId: state.publisherId })).toString("base64") };
+        if ([Capabilities, CapabilitiesV2].includes(params.path)) return { dataBase64: Buffer.from(JSON.stringify({ ...Base,
+            publisherId: params.path === Capabilities ? state.publisherId : state.weeklyPublisher })).toString("base64") };
         assert.equal(isResult, true);
         const id = params.path.split("/").at(-1).slice(0, -5);
         if (!state.results.has(id)) throw Object.assign(new Error("ENOENT private path"), { code: "ENOENT" });
@@ -97,6 +99,28 @@ function fixture(t) {
         state.store.get(identity, state.request, { watch: state.watch, ...options });
     return state;
 }
+
+test("an unusable optional advertisement falls back to daily without following a symlink", async t => {
+    const f = fixture(t);
+    f.weeklyPublisher = PublisherId;
+    f.metadata = (path, info) => path === CapabilitiesV2 ? { ...info, isSymlink: true } : info;
+    assert.equal((await f.get()).status, "ok");
+    assert.equal(f.markers.at(-1).snapshotVersion, undefined);
+    assert.equal(f.calls.some(call => call.method === "fs/readFile" && call.params.path === CapabilitiesV2), false);
+});
+
+test("only opts into weekly snapshots for the active remote publisher that advertises them", async t => {
+    const f = fixture(t);
+    assert.equal((await f.get()).status, "ok");
+    assert.equal(f.markers.at(-1).snapshotVersion, undefined);
+    f.weeklyPublisher = NextPublisher;
+    assert.equal((await f.get()).status, "ok");
+    assert.equal(f.markers.at(-1).snapshotVersion, undefined);
+    f.weeklyPublisher = PublisherId;
+    f.value = sample({ revision: 2, schemaVersion: 2, weekly: null });
+    assert.equal((await f.get()).snapshot.schemaVersion, 2);
+    assert.equal(f.markers.at(-1).snapshotVersion, 2);
+});
 
 test("one remote query watches before its marker and reads only capabilities and its matching response", async t => {
     const f = fixture(t);
@@ -650,7 +674,8 @@ test("real two-end filesystem demand uses native notifications, delivers a fresh
     assert.equal(scans, 1);
     assert.equal(watches.size, 0);
     assert.equal(calls.filter(x => x.method === "fs/readFile").every(x =>
-        x.params.path.endsWith("capabilities.json") || x.params.path.includes(`${path.sep}responses${path.sep}`)), true);
+        ["capabilities.json", "capabilities-v2.json"].includes(path.basename(x.params.path))
+        || x.params.path.includes(`${path.sep}responses${path.sep}`)), true);
     const idleCalls = calls.length;
     await new Promise(resolve => setTimeout(resolve, 40));
     assert.equal(calls.length, idleCalls);

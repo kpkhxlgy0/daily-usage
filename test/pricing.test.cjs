@@ -32,6 +32,38 @@ test('crossing 272000 input tokens keeps the same base input, cache and output r
         cachedInputTokens: 900000, outputTokens: 1000 })).usd, 1.95);
 });
 
+test('weekly Standard pricing applies long-context rates only above 272000 input tokens', () =>
+{
+    const options = { standard: true };
+    assert.equal(priceRequest(request({ inputTokens: 272000, cachedInputTokens: 72000,
+        outputTokens: 1000 }), options).usd, 0.4172);
+    assert.equal(priceRequest(request({ inputTokens: 272001, cachedInputTokens: 72000,
+        outputTokens: 1000 }), options).usd, 0.829404);
+    assert.equal(priceRequest(request({ model: 'gpt-6-astra', inputTokens: 300000,
+        cachedInputTokens: 280000, cacheWriteTokens: 10000, cacheWriteTtl: '12h', outputTokens: 1000 }), options).usd,
+    1.335);
+    assert.equal(priceRequest(request({ model: 'unpriced', inputTokens: 300000 }), options).unpriced, true);
+});
+
+test('weekly Standard quotes the published write retention by model and preserves known subtotals', () =>
+{
+    const options = { standard: true };
+    const pureWrite = request({ inputTokens: 100000, cachedInputTokens: 0, cacheWriteTokens: 100000,
+        cacheWriteTtl: '12h', outputTokens: 0 });
+    assert.equal(priceRequest(pureWrite).usd, 0.2);
+    assert.equal(priceRequest(pureWrite, options).usd, 0.5);
+    assert.equal(priceRequest({ ...pureWrite, cacheWriteTtl: '30m' }, options).usd, 0.25);
+    const fallback = priceRequest({ ...pureWrite, cacheWriteTtl: null }, options);
+    assert.equal(fallback.usd, 0.25);
+    assert.equal(fallback.estimated, true);
+    for (const [model, want] of [['gpt-5.5', 0.0066], ['gpt-5.4', 0.0033]])
+    {
+        const partial = priceRequest(request({ model, cacheWriteTokens: 100, cacheWriteTtl: '12h' }), options);
+        assert.equal(partial.usd, want);
+        assert.equal(partial.unpriced, true);
+    }
+});
+
 test('all verified Standard models use their own input, cached and output prices', () =>
 {
     const cases = [
@@ -92,4 +124,13 @@ test('invalid overlapping or noninteger token counts never yield a negative or i
         assert.equal(price.unpriced, true);
         assert.equal(price.usd, 0);
     }
+});
+test('conflicting retention fields keep weekly cache-write pricing visibly estimated', () => {
+    const { normalizeUsage } = require('../src/log-parser.cjs');
+    const usage = normalizeUsage({ input_tokens: 100000, output_tokens: 0, cache_write_input_tokens: 100000,
+        cache_write_ttl: '30m', cache_write_ttl_seconds: 43200 });
+    assert.equal(usage.cacheWriteTtl, null);
+    const price = priceRequest({ ...usage, model: 'gpt-6.1-sol' }, { standard: true });
+    assert.equal(price.usd, 0.25);
+    assert.equal(price.estimated, true);
 });

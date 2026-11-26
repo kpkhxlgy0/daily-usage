@@ -6,11 +6,12 @@ const { createHash, randomUUID } = require('node:crypto');
 const { createRolloutReader } = require('./vendor/rollout-reader.cjs');
 const { createLogParser } = require('./log-parser.cjs');
 const { priceRequest, Pricing, validTokens } = require('./pricing.cjs');
+const { validWeeklyData, weeklyWindow } = require('./weekly-quota.cjs');
 
 const DayMs = 24 * 60 * 60 * 1000;
 const BeijingOffsetMs = 8 * 60 * 60 * 1000;
 const RetentionDays = 30;
-const CacheVersion = 2;
+const CacheVersion = 3;
 const OffsetPairWindowMs = 5 * 60 * 1000;
 
 function beijingDate(timestamp)
@@ -148,7 +149,7 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
         return [...selected.values()].sort((a, b) => a.rank - b.rank || a.filename.localeCompare(b.filename));
     }
 
-    async function sourceData(source, cutoff, coverage)
+    async function sourceData(source, cutoff, generatedAt, coverage)
     {
         const key = digest(path.relative(codexHome, source.filename));
         const cacheFile = path.join(usageCacheDir, key + '.json');
@@ -166,13 +167,14 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
             }
         }
         if (cached && cached.schemaVersion === CacheVersion && cached.version === version
-            && Number.isFinite(cached.cutoff) && cached.cutoff <= cutoff && validCachedData(cached.data))
+            && Number.isFinite(cached.cutoff) && cached.cutoff <= cutoff && validCachedData(cached.data)
+            && validWeeklyData(cached.data, generatedAt))
         {
             memory.set(key, cached);
             coverage.cachedFiles++;
             return cached.data;
         }
-        const parser = createLogParser({ sourceId: 'file-' + key, minTimestamp: cutoff });
+        const parser = createLogParser({ sourceId: 'file-' + key, minTimestamp: cutoff, maxWeeklyTimestamp: generatedAt });
         const result = await reader.scan(source.filename, { onChunk: parser.onChunk });
         checkActive();
         const data = parser.finish();
@@ -224,7 +226,7 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
             checkActive();
             try
             {
-                const parsed = await sourceData(source, cutoff, coverage);
+                const parsed = await sourceData(source, cutoff, generatedAt, coverage);
                 data.push(parsed);
                 coverage.skippedRecords += parsed.skippedRecords;
                 coverage.oversizedRecords += parsed.oversizedRecords;
@@ -237,6 +239,27 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
             progress('scanning', coverage, ++processedFiles);
         }
         checkActive();
+        const window = weeklyWindow(data, generatedAt);
+        const weeklyEnd = window && (window.fullAt ?? generatedAt);
+        const weeklyRows = new Map();
+        const earlierCopies = new Map();
+        function includeWeekly(event, timestamp, estimated = false)
+        {
+            if (!window || timestamp < window.startAt || timestamp > weeklyEnd) return;
+            let row = weeklyRows.get(event.model);
+            if (!row)
+            {
+                row = { model: event.model, requests: 0, baseUsd: 0, usd: 0,
+                    unpricedRequests: 0, estimatedRequests: 0 };
+                weeklyRows.set(event.model, row);
+            }
+            const standard = priceRequest(event, { standard: true });
+            row.requests++;
+            row.baseUsd += priceRequest(event).usd;
+            row.usd += standard.usd;
+            if (standard.unpriced) row.unpricedRequests++;
+            if (estimated || standard.estimated) row.estimatedRequests++;
+        }
         const rows = new Map();
         let unpricedRequests = 0;
         function include(event, estimated = false)
@@ -292,6 +315,11 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
                 {
                     coverage.duplicateRequests++;
                     const previous = responses.get(event.id);
+                    if (window && event.timestamp < (earlierCopies.get(event.id) ?? previous.timestamp))
+                    {
+                        // 分叉副本的时间不得把已经发生的请求带入当前周窗口。
+                        earlierCopies.set(event.id, event.timestamp);
+                    }
                     if (usageKey(previous) !== usageKey(event) || previous.model !== event.model)
                     {
                         coverage.conflictingRequests++;
@@ -301,6 +329,10 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
                 responses.set(event.id, event);
                 include(event);
             }
+        }
+        if (window)
+        {
+            for (const event of responses.values()) includeWeekly(event, earlierCopies.get(event.id) ?? event.timestamp);
         }
         for (const timeline of modernTimeline.values()) timeline.sort((a, b) => a.timestamp - b.timestamp);
         const offsetPairs = new Map();
@@ -419,7 +451,11 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
                 legacyCandidates.set(key, candidate);
             }
         }
-        for (const event of legacyCandidates.values()) include(event, true);
+        for (const event of legacyCandidates.values())
+        {
+            include(event, true);
+            includeWeekly(event, event.timestamp, true);
+        }
         if (coverage.failedFiles) coverage.warnings.push(`有 ${coverage.failedFiles} 个用量文件读取失败。`);
         if (coverage.discoveryErrors) coverage.warnings.push(`有 ${coverage.discoveryErrors} 处历史目录无法读取。`);
         if (coverage.skippedRecords) coverage.warnings.push(`跳过 ${coverage.skippedRecords} 条不完整记录，统计覆盖不全。`);
@@ -433,8 +469,15 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
         if (coverage.cacheErrors) coverage.warnings.push('用量缓存写入失败，仍显示已读取的统计。');
         const result = [...rows.values()].sort((a, b) => b.date.localeCompare(a.date) || a.model.localeCompare(b.model));
         for (const row of result) row.usd = Number(row.usd.toFixed(12));
+        const weekly = window ? { ...window, rows: [...weeklyRows.values()]
+            .sort((a, b) => a.model.localeCompare(b.model)) } : null;
+        for (const row of weekly?.rows || [])
+        {
+            row.baseUsd = Number(row.baseUsd.toFixed(12));
+            row.usd = Number(row.usd.toFixed(12));
+        }
         progress('complete', coverage, processedFiles);
-        return { generatedAt, timezone: 'Asia/Shanghai', from, to, rows: result, coverage, pricing: { ...Pricing } };
+        return { generatedAt, timezone: 'Asia/Shanghai', from, to, rows: result, weekly, coverage, pricing: { ...Pricing } };
     }
 
     return {

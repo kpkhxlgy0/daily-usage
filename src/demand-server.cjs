@@ -5,7 +5,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { setTimeout: delay } = require('node:timers/promises');
-const { normalizeThreadId } = require('./protocol.cjs');
+const { normalizeThreadId, validateSnapshot, snapshotForPeer } = require('./protocol.cjs');
 const { demandPaths, validateMarker, validateCapabilities, validateResult,
     MaxDemandBytes, MaxResultBytes } = require('./demand-protocol.cjs');
 
@@ -230,10 +230,8 @@ function createDemandServer({ codexHome, service, now = Date.now })
             finish(entry);
             if (state?.status === 'ok')
             {
-                const snapshot = { ...state.snapshot, publisherId };
-                if (!validateResult({ schemaVersion: 1, source: 'com.kpk.daily-usage', demandVersion: 1,
-                    requestId: entry.marker.requestId, publisherId, updatedAt: now(), status: 'ok', snapshot },
-                { requestId: entry.marker.requestId, publisherId, now: now() }).ok) throw new Error('invalid-report');
+                if (!validateSnapshot(state.snapshot, { now: now() }).ok) throw new Error('invalid-report');
+                const snapshot = { ...snapshotForPeer(state.snapshot, entry.marker.snapshotVersion), publisherId };
                 await publish(entry, 'ok', { snapshot });
             }
             else await publish(entry, 'error', { error: 'collector-failed' });
@@ -323,6 +321,8 @@ function createDemandServer({ codexHome, service, now = Date.now })
         watcher.on('error', () => { void dispose(); });
         const capabilities = { schemaVersion: 1, source: 'com.kpk.daily-usage', demandVersion: 1, publisherId };
         await atomicWrite(paths.capabilities, capabilities, () => true);
+        try { await atomicWrite(paths.capabilitiesV2, capabilities, () => true); }
+        catch { /* 周快照协商不可用时仍能处理原有日报请求。 */ }
     })();
 
     function dispose()
@@ -342,14 +342,17 @@ function createDemandServer({ codexHome, service, now = Date.now })
             await ready.catch(() => {});
             await Promise.all([...tasks]);
             if (!rootInfo || !requestInfo || !responseInfo) return;
-            try
+            for (const filename of [paths.capabilities, paths.capabilitiesV2])
             {
-                await checkDirectories();
-                const capability = await readOwnedJson(paths.capabilities, MaxDemandBytes);
-                if (validateCapabilities(capability).ok && capability.publisherId === publisherId)
-                    await fs.unlink(paths.capabilities);
+                try
+                {
+                    await checkDirectories();
+                    const capability = await readOwnedJson(filename, MaxDemandBytes);
+                    if (validateCapabilities(capability).ok && capability.publisherId === publisherId)
+                        await fs.unlink(filename);
+                }
+                catch { /* 不删除被其他发布者接管的能力文件。 */ }
             }
-            catch { /* 不删除被其他发布者接管的能力文件。 */ }
             entries.clear();
         })();
         return disposal;

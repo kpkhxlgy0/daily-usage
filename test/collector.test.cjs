@@ -24,11 +24,12 @@ function context(turn, model = 'gpt-6.1-sol')
 }
 
 function modern(id, { thread = 'root', turn = 'turn-1', timestamp = Stamp, input = 1000,
-    cached = 200, write = 0, output = 100, ...extra } = {})
+    cached = 200, write = 0, writeTtl, output = 100, ...extra } = {})
 {
     return { type: 'token_usage_record', timestamp, payload: { response_id: id,
         thread_id: thread, turn_id: turn, usage: { input_tokens: input, cached_input_tokens: cached,
             cache_write_input_tokens: write, output_tokens: output, reasoning_output_tokens: 60,
+            ...(writeTtl ? { cache_write_ttl: writeTtl } : {}),
             total_tokens: input + output }, ...extra } };
 }
 
@@ -40,6 +41,14 @@ function legacy(input, output, { timestamp = Stamp, last, cached = 0 } = {})
         ...(last ? { last_token_usage: { input_tokens: last[0], cached_input_tokens: 0,
             output_tokens: last[1], total_tokens: last[0] + last[1] } } : {}),
     } } };
+}
+
+function quota(timestamp, reset, usedPercent, { limit = 'codex', slot = 'primary', minutes = 10080 } = {})
+{
+    const rate_limits = { [slot]: { used_percent: usedPercent, window_minutes: minutes,
+        resets_at: Date.parse(reset) / 1000 } };
+    if (limit !== null) rate_limits.limit_id = limit;
+    return { type: 'event_msg', timestamp, payload: { type: 'token_count', info: null, rate_limits } };
 }
 
 async function fixture(t)
@@ -514,4 +523,161 @@ test('missing sources yield an empty report and disposal rejects later scans', a
     assert.equal(report.generatedAt, Now);
     await collector.dispose();
     await assert.rejects(collector.scan(), { code: 'ERR_DAILY_USAGE_DISPOSED' });
+});
+
+test('weekly usage starts at the current reset and includes the first 100% response only once', async t =>
+{
+    const f = await fixture(t);
+    const start = '2026-11-12T12:00:11.038Z';
+    const reset = '2026-11-19T12:00:03Z';
+    const resetWithJitter = '2026-11-19T12:00:01Z';
+    const fullAt = '2026-11-16T10:10:00Z';
+    const latest = '2026-11-16T11:00:00Z';
+    const fullResponse = modern('first-full', { timestamp: fullAt, input: 300000, cached: 280000, output: 1000 });
+    await f.write('sessions/active.jsonl', [meta('root'), context('turn-1'),
+        modern('copied-old', { timestamp: start }),
+        modern('first-in-window', { timestamp: start }),
+        fullResponse, quota(fullAt, resetWithJitter, 100),
+        modern('after-full', { timestamp: latest }), quota(latest, reset, 100),
+        quota('2026-11-16T11:10:00Z', '2026-11-20T11:10:00Z', 0, { limit: 'other' }),
+        quota('2026-11-16T11:20:00Z', '2026-11-23T11:20:00Z', 0, { minutes: 300 })]);
+    await f.write('archived_sessions/older.jsonl' + (HasZstd ? '.zst' : ''), [meta('old'), context('turn-1'),
+        modern('copied-old', { timestamp: '2026-11-12T11:59:56Z' }),
+        quota('2026-11-12T11:59:57Z', '2026-11-12T12:00:00Z', 100),
+        quota(start, reset, 0, { slot: 'secondary' }),
+        fullResponse], { compressed: HasZstd });
+    const report = await f.collector().scan();
+    assert.deepEqual(report.weekly, { startAt: Date.parse(start), startKind: 'reset',
+        fullAt: Date.parse(fullAt), usedPercent: 100, sampleAt: Date.parse(latest), rows: [
+            { model: 'gpt-6.1-sol', requests: 2, baseUsd: 0.08062, usd: 0.15362,
+                unpricedRequests: 0, estimatedRequests: 0 },
+        ] });
+    assert.equal(report.rows.find(row => row.date === '2026-11-12').requests, 2);
+    assert.equal(report.rows.find(row => row.date === '2026-11-16').usd, 0.08062);
+    assert.equal(report.coverage.duplicateRequests, 2);
+});
+
+test('a valid weekly expiry infers the start and keeps legacy and unpriced requests before generatedAt', async t =>
+{
+    const f = await fixture(t);
+    const reset = '2026-11-19T12:00:00Z';
+    const start = '2026-11-12T12:00:00Z';
+    const sampled = '2026-11-16T09:00:00Z';
+    const future = '2026-11-16T12:00:01Z';
+    await f.write('sessions/older.jsonl', [meta('old'), context('turn-1'),
+        legacy(500, 50, { last: [500, 50], timestamp: '2026-11-12T11:59:59Z' }),
+        legacy(1000, 100, { last: [500, 50], timestamp: start }),
+        quota(sampled, reset, 38.5, { limit: null }), quota(future, reset, 100, { limit: null })]);
+    await f.write('sessions/modern.jsonl', [meta('root'), context('turn-1', 'unpriced'),
+        modern('unpriced', { timestamp: '2026-11-16T11:30:00Z' }), modern('future', { timestamp: future })]);
+    let now = Now;
+    const collector = f.collector({ now: () => now });
+    const expected = { startAt: Date.parse(start), startKind: 'inferred',
+        fullAt: null, usedPercent: 38.5, sampleAt: Date.parse(sampled), rows: [
+            { model: 'gpt-6.1-sol', requests: 1, baseUsd: 0.0015, usd: 0.0015,
+                unpricedRequests: 0, estimatedRequests: 1 },
+            { model: 'unpriced', requests: 1, baseUsd: 0, usd: 0, unpricedRequests: 1, estimatedRequests: 0 },
+        ] };
+    assert.deepEqual((await collector.scan()).weekly, expected);
+    const cached = await collector.scan();
+    assert.deepEqual(cached.weekly, expected);
+    assert.equal(cached.coverage.cachedFiles, 2);
+    now = Date.parse(future);
+    const next = await collector.scan();
+    assert.equal(next.coverage.parsedFiles, 1);
+    assert.deepEqual(next.weekly, { ...expected, fullAt: now, usedPercent: 100, sampleAt: now,
+        rows: [expected.rows[0], { ...expected.rows[1], requests: 2, unpricedRequests: 2 }] });
+    now = Now;
+    assert.deepEqual((await collector.scan()).weekly, expected);
+});
+
+test('expired or malformed weekly observations cannot label this cycle', async t =>
+{
+    const f = await fixture(t);
+    const reset = '2026-11-19T12:00:00Z';
+    await f.write('sessions/quota.jsonl', [meta('root'), context('turn-1'), modern('paid'),
+        quota(Stamp, '2026-11-16T11:00:00Z', 100),
+        quota(Stamp, '2026-11-16T12:00:00Z', 50),
+        quota(Stamp, reset, -1), quota(Stamp, reset, '50'), quota(Stamp, reset, 101),
+        quota(Stamp, 'invalid', 0), quota(Stamp, '2026-11-24T12:00:00Z', 0),
+        quota('2026-11-16T14:00:00Z', reset, 0)]);
+    const report = await f.collector().scan();
+    assert.equal(report.weekly, null);
+    assert.equal(report.rows[0].requests, 1);
+    assert.equal(report.coverage.skippedRecords, 0);
+});
+
+test('expiry jitter that would place the inferred start after usage falls back to the earliest real sample', async t =>
+{
+    const f = await fixture(t);
+    const firstSample = '2026-11-12T12:00:00Z';
+    await f.write('sessions/early-quota.jsonl', [quota(firstSample, '2026-11-19T12:00:03Z', 1),
+        quota(Stamp, '2026-11-19T12:00:04Z', 25)]);
+    const report = await f.collector().scan();
+    assert.deepEqual(report.weekly, { startAt: Date.parse(firstSample), startKind: 'observed', fullAt: null,
+        usedPercent: 25, sampleAt: Date.parse(Stamp), rows: [] });
+});
+
+test('weekly inference uses the earliest expiry in the current jitter range and ignores a late zero', async t =>
+{
+    const f = await fixture(t);
+    const earliest = '2026-11-19T12:00:00Z';
+    const latest = '2026-11-19T12:00:04Z';
+    const first = '2026-11-12T12:00:10Z';
+    await f.write('sessions/early-quota.jsonl', [meta('root'), context('turn-1'),
+        modern('first-request', { timestamp: '2026-11-12T12:00:01Z' }), quota(first, earliest, 1),
+        quota('2026-11-12T12:05:00Z', latest, 0), quota(Stamp, latest, 25)]);
+    const report = await f.collector().scan();
+    assert.deepEqual(report.weekly, { startAt: Date.parse('2026-11-12T12:00:00Z'), startKind: 'inferred',
+        fullAt: null, usedPercent: 25, sampleAt: Date.parse(Stamp), rows: [{ model: 'gpt-6.1-sol',
+            requests: 1, baseUsd: 0.00262, usd: 0.00262, estimatedRequests: 0, unpricedRequests: 0 }] });
+});
+
+test('a first zero an hour after the predicted reset keeps earlier requests in the inferred window', async t =>
+{
+    const f = await fixture(t);
+    const start = '2026-11-12T12:00:00Z';
+    const reset = '2026-11-19T12:00:00Z';
+    const first = '2026-11-12T13:00:00Z';
+    await f.write('sessions/late-first-quota.jsonl', [meta('root'), context('turn-1'),
+        modern('paid-before-first-quota', { timestamp: '2026-11-12T12:01:00Z' }), quota(first, reset, 0)]);
+    const report = await f.collector().scan();
+    assert.deepEqual(report.weekly, { startAt: Date.parse(start), startKind: 'inferred',
+        fullAt: null, usedPercent: 0, sampleAt: Date.parse(first), rows: [{ model: 'gpt-6.1-sol',
+            requests: 1, baseUsd: 0.00262, usd: 0.00262, estimatedRequests: 0, unpricedRequests: 0 }] });
+});
+
+test('an expired latest weekly cycle never falls back to older conflicting future expiry evidence', async t =>
+{
+    const f = await fixture(t);
+    await f.write('sessions/older-quota.jsonl', [quota('2026-11-16T09:00:00Z', '2026-11-17T12:00:00Z', 100)]);
+    await f.write('sessions/newer-quota.jsonl', [quota(Stamp, '2026-11-16T11:00:00Z', 50)]);
+    assert.equal((await f.collector().scan()).weekly, null);
+});
+
+test('the latest observation with an earlier expiry still matches the same cycle across reset jitter', async t =>
+{
+    const f = await fixture(t);
+    await f.write('sessions/quota.jsonl', [quota('2026-11-16T09:00:00Z', '2026-11-16T12:00:03Z', 100),
+        quota(Stamp, '2026-11-16T11:59:59Z', 100)]);
+    const report = await f.collector().scan();
+    assert.equal(report.weekly.sampleAt, Date.parse(Stamp));
+    assert.equal(report.weekly.fullAt, Date.parse('2026-11-16T09:00:00Z'));
+});
+
+test('only weekly Standard charges published cache writes and marks estimated or missing amounts', async t =>
+{
+    const f = await fixture(t);
+    await f.write('sessions/cache-write.jsonl', [meta('root'), context('turn-1'),
+        modern('ttl-known', { input: 100000, cached: 0, write: 100000, writeTtl: '12h', output: 0 }),
+        modern('ttl-unknown', { input: 100000, cached: 0, write: 100000, output: 0 }),
+        modern('write-unpriced', { model: 'gpt-5.5', input: 1000, cached: 200, write: 100, writeTtl: '12h' }),
+        quota(Stamp, '2026-11-19T12:00:00Z', 25)]);
+    const report = await f.collector().scan();
+    assert.deepEqual(report.weekly.rows, [
+        { model: 'gpt-5.5', requests: 1, baseUsd: 0.0071, usd: 0.0066, unpricedRequests: 1, estimatedRequests: 0 },
+        { model: 'gpt-6.1-sol', requests: 2, baseUsd: 0.4, usd: 0.75, unpricedRequests: 0, estimatedRequests: 1 },
+    ]);
+    assert.deepEqual(report.rows.map(row => [row.model, row.usd, row.unpricedRequests, row.estimatedRequests]),
+        [['gpt-5.5', 0.0071, 0, 0], ['gpt-6.1-sol', 0.4, 0, 0]]);
 });

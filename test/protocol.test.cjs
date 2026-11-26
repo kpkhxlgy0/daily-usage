@@ -30,6 +30,39 @@ test("accepts the shared snapshot contract without mutating it", () => {
     assert.deepEqual(validateSnapshot(snapshot({ rows: [] }), { now: Now }), { ok: true });
 });
 
+test("downgrades only a legacy viewer's wire snapshot and preserves the local weekly report", () => {
+    const { snapshotForPeer } = require("../src/protocol.cjs");
+    const daily = snapshot();
+    const modern = { ...daily, schemaVersion: 2, weekly: null };
+    assert.deepEqual(snapshotForPeer(modern), daily);
+    assert.equal(snapshotForPeer(modern, 2), modern);
+    assert.equal(snapshotForPeer(daily, 2), daily);
+    assert.equal(modern.schemaVersion, 2);
+    assert.equal(modern.weekly, null);
+});
+
+test("weekly snapshots carry only bounded per-model amounts and a consistent observed cutoff", () => {
+    const row = { model: "example", requests: 2, baseUsd: 1, usd: 1.5, unpricedRequests: 0, estimatedRequests: 1 };
+    const weekly = { startAt: Now - 86400000, startKind: "reset", usedPercent: 45.5,
+        sampleAt: Now - 1000, fullAt: null, rows: [row] };
+    const check = value => validateSnapshot(snapshot({ schemaVersion: 2, weekly: value }), { now: Now }).ok;
+    assert.equal(check(weekly), true);
+    assert.equal(check(null), true);
+    assert.equal(check({ ...weekly, startKind: "observed", rows: [] }), true);
+    const missingPrice = { ...row, baseUsd: 0.2, usd: 0, requests: 1, unpricedRequests: 1 };
+    assert.equal(check({ ...weekly, rows: [missingPrice] }), true);
+    assert.equal(check({ ...weekly, rows: [{ ...missingPrice, unpricedRequests: 0 }] }), false);
+    assert.equal(check({ ...weekly, startKind: "inferred", fullAt: Now - 1500, usedPercent: 100 }), true);
+    assert.equal(validateSnapshot(snapshot({ weekly }), { now: Now }).ok, false);
+    for (const patch of [{ startKind: "rolling" }, { startAt: Now }, { sampleAt: Now + 1 },
+        { usedPercent: 101 }, { usedPercent: 100 }, { fullAt: Now - 2000 }, { rows: [row, row] },
+        { usedPercent: 100, fullAt: Now }, { rows: [{ ...row, usd: -1 }] },
+        { rows: [{ ...row, unpricedRequests: 3 }] }, { rows: [{ ...row, session: "private" }] },
+        { rows: [{ ...row, model: "<img>" }] }, { org: "private" }]) {
+        assert.equal(check({ ...weekly, ...patch }), false, JSON.stringify(patch));
+    }
+});
+
 test("stale snapshots remain valid while untrusted future snapshots are rejected", () => {
     assert.equal(validateSnapshot(snapshot({ generatedAt: Now - 3600000 }), { now: Now }).ok, true);
     assert.equal(validateSnapshot(snapshot({ generatedAt: Now + 5000 }), { now: Now }).ok, true);

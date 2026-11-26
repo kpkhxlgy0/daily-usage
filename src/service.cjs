@@ -154,7 +154,7 @@ function createService({ codexHome, dataDir, now = Date.now,
                     publishing = publishing.then(async () =>
                     {
                         if (!active(job)) return;
-                        const snapshot = { ...message.report, schemaVersion: 1, source: 'com.kpk.daily-usage',
+                        const snapshot = { weekly: null, ...message.report, schemaVersion: 2, source: 'com.kpk.daily-usage',
                             machineId, publisherId, revision: revision + 1 };
                         if (!validateSnapshot(snapshot, { now: now() }).ok
                             || Buffer.byteLength(JSON.stringify(snapshot)) > MaxSnapshotBytes)

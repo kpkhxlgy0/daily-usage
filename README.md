@@ -1,18 +1,18 @@
 # Daily Usage
 
-独立的 Codex++ tweak，按北京时间查看今天、最近 7 天、最近 30 天的 Token 和费用估算（USD）。
+独立的 Codex++ tweak，可查看今天、最近 7 天、最近 30 天和本轮周额度的用量。时间均为北京时间。
 包含本机及本窗口打开过的 Remote Control 机器，按日期和模型拆分。
 本机显示“本机”；只有一台远程机器时显示“远程”，多台时优先显示 Codex 中的连接名称。
 离线保留上次名称，未识别名称时显示连接 ID。
-版本 0.1.10；最低 Codex++ 1.0.10。无需启用 Session Stats，也不会修改它。
+当前版本为 0.2.0，最低支持 Codex++ 1.0.10。Daily Usage 可独立使用。
 
 ## 安装和使用
 
 推荐在 **Codex++ Settings → Tweak Store** 搜索 **Daily Usage** 并安装。
 运行时无 npm 依赖，安装后打开 Codex 设置中的 Daily Usage 页面。
 
-也可以从 [GitHub Release v0.1.10](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.10)
-下载 `daily-usage-0.1.10.zip`，解压到长期保留的目录。
+也可以从 [GitHub Release v0.2.0](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.2.0)
+下载 `daily-usage-0.2.0.zip`，解压到长期保留的目录。
 Windows 已安装 Codex++ 时，在解压目录运行：
 
 ```powershell
@@ -45,6 +45,16 @@ Store 安装副本只会禁用，不删除。脚本使用 `CODEX_PLUSPLUS_HOME`�
 
 ## 数字表示什么
 
+### 本轮周额度
+
+在时间下拉框选择「本轮周额度」。运行端从 Codex 日志读取 10,080 分钟的额度窗口。能观测到重置归零时，从首次归零计起；能够确认下次重置时间时，也可按窗口长度推算本轮起点。界面标出起点的依据和最近的额度采样时间。
+
+按去重请求的实际时间截取区间。未观察到满额时计算到本次查询，观察到 100% 后固定在首次满额的时刻。额度未知或上个窗口已经过期时显示「—」。切换时间筛选会复用这次查询的报告。
+
+表格按各模型的 Standard API 等价金额降序排列。「基础价」沿用日统计口径。「含长上下文」逐请求应用 Standard 的上下文阶梯和适用的缓存写入价格；金额占比按已定价的美元计算。额度百分比属于账号，金额只覆盖所选机器留存的请求。远程两端都支持周视图时才传周汇总；旧端仍可使用原有日期视图。
+
+### 按日期统计
+
 - 日期为 Asia/Shanghai；今天包含当日截至最后扫描的请求，7/30 天均包含今天。
 - 输入总量包含普通输入、缓存读取和缓存写入。总 Token = 输入 + 输出；推理已在输出中，不再相加。
 - 使用逐响应的实际用量，按 `response_id` 跨日志去重；原生子代理单独扫描后并入总量。
@@ -56,7 +66,7 @@ Store 安装副本只会禁用，不删除。脚本使用 `CODEX_PLUSPLUS_HOME`�
 
 ## 费用估算（USD）
 
-价格表更新于 **2026-11-18**，按模型及 Token 类别使用公开 Standard API 基础单价折算，不叠加长上下文或缓存写入 TTL 加价。
+日期视图和周视图的「基础价」使用 **2026-11-18** 的公开 Standard API 基础单价，不叠加长上下文或缓存写入 TTL 加价。
 这是按基础单价计算的参考金额，不是历史 API 发票复原或 Codex 订阅账单，也不代表订阅额度的消耗权重。
 日志未完整记录服务档位，因此不声称计算了实际 Fast、Flex、Ultrafast 或企业合同费用。
 历史日期也使用这张价格表；更新价格表需更新 tweak。
@@ -71,7 +81,9 @@ GPT-6.2 的基础单价如下，单位为美元／百万 Token。
 还支持 GPT-6 Astra、GPT-6.1 Sol/Terra、GPT-6 Luna/Sol、GPT-5.6 Sol/Terra/Luna、GPT-5.5、GPT-5.4。
 未知 ID 不猜测为相似模型。普通输入和缓存写入均按普通输入基础价计一次，缓存读取按缓存读取价计算；
 缓存写入缺少 TTL 时也使用此口径。普通输入、缓存读取和缓存写入的 Token 分栏保持独立、不重叠。
-超过 272,000 输入 token 时也使用相同基础单价。
+周视图的「含长上下文」按单次请求计价。适用长上下文阶梯的请求超过 272,000 个输入 token 时，整笔输入与缓存按 2 倍、输出按 1.5 倍计价。
+有公开写入价格的模型按日志记录的缓存保留时长计价：30 分钟为普通输入价的 1.25 倍，12 小时为 2.5 倍。缺少时长时按 30 分钟估算。
+没有公开缓存写入价格时，仍计入其他可定价的输入和输出，并标出未定价部分。
 不含图像生成、搜索等工具单独费用，也不含区域溢价、税费或折扣。
 
 来源：[官方价格表](https://developers.openai.com/api/docs/pricing)、
@@ -87,7 +99,7 @@ GPT-6.2 的基础单价如下，单位为美元／百万 Token。
 
 运行端写入 `$CODEX_HOME/.daily-usage/machine.json` 和 `summary.json`，
 并使用同目录的 `capabilities.json`、`requests/` 和 `responses/` 处理按需查询。
-汇总仅含机器/发布者 ID、时间、按日期模型的 token 和美元、覆盖状态；不含聊天正文或认证信息。
+汇总包含机器和发布者 ID、时间、每日各模型用量、周额度采样边界、模型金额及覆盖状态。周视图只传聚合数值。
 缓存位于 Codex++ `tweak-data/com.kpk.daily-usage/cache`。禁用会结束 worker、文件监听、IPC 和未完成的查询。
 
 远程机器读取自己的日志并完成计算；查看端通过当前 Codex RC 连接发送固定格式的查询/取消标记，
@@ -120,7 +132,7 @@ CLI 输出 JSON；默认缓存写到所选 CODEX_HOME 的 `.daily-usage/cache`�
 只读原日志，但会写自己的统计缓存。
 
 源码：[kpkhxlgy0/daily-usage](https://github.com/kpkhxlgy0/daily-usage)。
-版本：[v0.1.10](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.1.10)。
+版本见 [v0.2.0 发布页](https://github.com/kpkhxlgy0/daily-usage/releases/tag/v0.2.0)。
 本机功能及原生压缩日志已验证；按需协议已通过双端文件系统自动化测试，
 0.1.3 的真实双机 Remote Control 通知与取消链路尚待安装更新后验证。
 

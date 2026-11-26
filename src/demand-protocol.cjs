@@ -21,7 +21,8 @@ function demandPaths(codexHome, pathApi = path) {
     if (typeof codexHome !== "string" || !pathApi.isAbsolute(codexHome)) throw new TypeError("Invalid CODEX_HOME");
     const directory = pathApi.join(codexHome, ".daily-usage");
     return { directory, requests: pathApi.join(directory, "requests"), responses: pathApi.join(directory, "responses"),
-        capabilities: pathApi.join(directory, "capabilities.json") };
+        capabilities: pathApi.join(directory, "capabilities.json"),
+        capabilitiesV2: pathApi.join(directory, "capabilities-v2.json") };
 }
 
 function makeMarker(requestId, now, action = "query", baseMarker) {
@@ -39,8 +40,9 @@ function makeMarker(requestId, now, action = "query", baseMarker) {
 }
 
 function validateMarker(value, { now = Date.now() } = {}) {
-    if (!integer(now) || !fields(value, ["schemaVersion", "source", "demandVersion", "requestId", "action",
-        "sequence", "requestedAt", "expiresAt"]) || !version(value) || !normalizeThreadId(value.requestId)
+    const keys = ["schemaVersion", "source", "demandVersion", "requestId", "action", "sequence", "requestedAt", "expiresAt"];
+    if (value?.snapshotVersion === 2) keys.push("snapshotVersion");
+    if (!integer(now) || !fields(value, keys) || !version(value) || !normalizeThreadId(value.requestId)
         || !(value.action === "query" && value.sequence === 1 || value.action === "cancel" && value.sequence === 2)
         || !integer(value.requestedAt) || !integer(value.expiresAt) || value.expiresAt <= value.requestedAt
         || value.expiresAt - value.requestedAt > MaxDemandMs || value.requestedAt - now > FutureSkewMs

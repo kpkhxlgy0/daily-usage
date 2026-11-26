@@ -23,9 +23,14 @@ test("markers use a bounded lifetime and cancellation preserves the query identi
     assert.deepEqual(demandPaths("/home/me/.codex", path.posix), {
         directory: "/home/me/.codex/.daily-usage", requests: "/home/me/.codex/.daily-usage/requests",
         responses: "/home/me/.codex/.daily-usage/responses",
-        capabilities: "/home/me/.codex/.daily-usage/capabilities.json" });
+        capabilities: "/home/me/.codex/.daily-usage/capabilities.json",
+        capabilitiesV2: "/home/me/.codex/.daily-usage/capabilities-v2.json" });
     assert.equal(demandPaths("C:\\Codex", path.win32).requests, "C:\\Codex\\.daily-usage\\requests");
     assert.equal(validateMarker(marker, { now: Now }).ok, true);
+    const weekly = { ...marker, snapshotVersion: 2 };
+    assert.equal(validateMarker(weekly, { now: Now }).ok, true);
+    assert.equal(validateMarker({ ...weekly, snapshotVersion: 3 }, { now: Now }).ok, false);
+    assert.equal(makeMarker(Id, Now, "cancel", weekly).snapshotVersion, 2);
     assert.equal(validateMarker({ ...marker, action: "cancel", sequence: 2 }, { now: Now }).ok, true);
     assert.equal(MaxDemandBytes, 2048);
     assert.equal(MaxResultBytes, 2 * 1024 * 1024 + 4096);

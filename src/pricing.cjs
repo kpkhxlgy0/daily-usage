@@ -3,6 +3,11 @@
 const Pricing = Object.freeze({ basis: 'codex-base-estimate', asOf: '2026-11-18',
     source: 'https://developers.openai.com/api/docs/pricing.md' });
 const Million = 1000000;
+const LongContextInputTokens = 272000;
+const LongContextInputMultiplier = 2;
+const LongContextOutputMultiplier = 1.5;
+const ShortCacheWriteMultiplier = 1.25;
+const LongCacheWriteMultiplier = 2.5;
 
 // Standard USD per million tokens: input, output, cached input.
 const Rates = new Map([
@@ -19,6 +24,7 @@ const Rates = new Map([
     ['gpt-5.5', [5, 30, 0.5]],
     ['gpt-5.4', [2.5, 15, 0.25]],
 ]);
+const ModelsWithoutCacheWriteRates = new Set(['gpt-5.5', 'gpt-5.4']);
 
 function validTokens(value)
 {
@@ -26,7 +32,7 @@ function validTokens(value)
 }
 
 function priceRequest({ model, inputTokens, cachedInputTokens = 0, cacheWriteTokens = 0,
-    outputTokens } = {})
+    cacheWriteTtl, outputTokens } = {}, { standard = false } = {})
 {
     if (![inputTokens, cachedInputTokens, cacheWriteTokens, outputTokens].every(validTokens)
         || cachedInputTokens > inputTokens || cacheWriteTokens > inputTokens - cachedInputTokens)
@@ -37,10 +43,30 @@ function priceRequest({ model, inputTokens, cachedInputTokens = 0, cacheWriteTok
     const rate = Rates.get(model);
     if (!rate) return { usd: 0, unpriced: true, uncachedInputTokens, reasons: ['unknown-model'] };
     const [inputRate, outputRate, cachedRate] = rate;
-    const subtotal = (uncachedInputTokens + cacheWriteTokens) * inputRate
-        + cachedInputTokens * cachedRate + outputTokens * outputRate;
-    return { usd: Number((subtotal / Million).toFixed(12)), unpriced: false,
-        uncachedInputTokens, reasons: [] };
+    let cacheWriteMultiplier = 1;
+    let estimated = false;
+    const reasons = [];
+    if (standard && cacheWriteTokens > 0)
+    {
+        if (ModelsWithoutCacheWriteRates.has(model))
+        {
+            cacheWriteMultiplier = 0;
+            reasons.push('unknown-cache-write-rate');
+        }
+        else
+        {
+            cacheWriteMultiplier = cacheWriteTtl === '12h' ? LongCacheWriteMultiplier : ShortCacheWriteMultiplier;
+            estimated = cacheWriteTtl !== '12h' && cacheWriteTtl !== '30m';
+        }
+    }
+    const inputPrice = (uncachedInputTokens + cacheWriteTokens * cacheWriteMultiplier) * inputRate
+        + cachedInputTokens * cachedRate;
+    const outputPrice = outputTokens * outputRate;
+    const subtotal = standard && inputTokens > LongContextInputTokens
+        ? inputPrice * LongContextInputMultiplier + outputPrice * LongContextOutputMultiplier
+        : inputPrice + outputPrice;
+    return { usd: Number((subtotal / Million).toFixed(12)), unpriced: reasons.length > 0,
+        uncachedInputTokens, reasons, ...(estimated ? { estimated } : {}) };
 }
 
 module.exports = { priceRequest, Pricing, validTokens };

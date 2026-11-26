@@ -34,17 +34,48 @@ function validDate(value) {
     return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
 }
 
+const WeeklyKeys = ["startAt", "startKind", "fullAt", "sampleAt", "usedPercent", "rows"];
+const WeeklyRowKeys = ["model", "requests", "baseUsd", "usd", "unpricedRequests", "estimatedRequests"];
+const amount = value => Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
+
+function validWeekly(week, generatedAt) {
+    if (week === null) return true;
+    if (!exactKeys(week, WeeklyKeys) || !["reset", "inferred", "observed"].includes(week.startKind)
+        || !integer(week.startAt) || !integer(week.sampleAt)
+        || week.startAt > week.sampleAt || week.sampleAt > generatedAt
+        || !Number.isFinite(week.usedPercent) || week.usedPercent < 0 || week.usedPercent > 100
+        || !Array.isArray(week.rows) || week.rows.length > 10000) return false;
+    if ((week.fullAt !== null) !== (week.usedPercent === 100)
+        || week.fullAt !== null && (!integer(week.fullAt) || week.fullAt < week.startAt
+            || week.fullAt > week.sampleAt)) return false;
+    const models = new Set();
+    for (const row of week.rows) {
+        if (!exactKeys(row, WeeklyRowKeys) || !concise(row.model, 128)
+            || !/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(row.model) || models.has(row.model)
+            || !integer(row.requests) || row.requests === 0
+            || !integer(row.estimatedRequests) || row.estimatedRequests > row.requests
+            || !integer(row.unpricedRequests) || row.unpricedRequests > row.requests
+            || !amount(row.baseUsd) || !amount(row.usd)
+            || (row.unpricedRequests === 0 && row.usd < row.baseUsd)) return false;
+        models.add(row.model);
+    }
+    return true;
+}
+
 function validateSnapshot(value, options = {}) {
     const invalid = reason => ({ ok: false, reason });
     if (!record(options)) return invalid("invalid");
     const { now = Date.now() } = options;
-    if (!integer(now) || !exactKeys(value, RootKeys) || value.schemaVersion !== 1
+    const weeklyFormat = value?.schemaVersion === 2;
+    if (!integer(now) || !exactKeys(value, weeklyFormat ? [...RootKeys, "weekly"] : RootKeys)
+        || !weeklyFormat && value.schemaVersion !== 1
         || value.source !== "com.kpk.daily-usage" || !normalizeThreadId(value.machineId)
         || !normalizeThreadId(value.publisherId) || !integer(value.revision) || value.revision === 0
         || !integer(value.generatedAt) || value.timezone !== "Asia/Shanghai"
         || !validDate(value.from) || !validDate(value.to) || value.from > value.to
         || !Array.isArray(value.rows) || value.rows.length > 10000) return invalid("invalid");
     if (value.generatedAt - now > FutureSkewMs) return invalid("future");
+    if (weeklyFormat && !validWeekly(value.weekly, value.generatedAt)) return invalid("invalid");
     const identities = new Set();
     for (const row of value.rows) {
         if (!exactKeys(row, RowKeys) || !validDate(row.date) || row.date < value.from || row.date > value.to
@@ -74,6 +105,12 @@ function validateSnapshot(value, options = {}) {
     } catch { return invalid("invalid"); }
     if (!currentPricing) return invalid("update-required");
     return { ok: true };
+}
+
+function snapshotForPeer(snapshot, requestedVersion) {
+    if (snapshot.schemaVersion !== 2 || requestedVersion === 2) return snapshot;
+    const { weekly, ...daily } = snapshot;
+    return { ...daily, schemaVersion: 1 };
 }
 
 function safePath(value) {
@@ -119,5 +156,5 @@ function snapshotContext(rolloutPath, threadId) {
     return null;
 }
 
-module.exports = { validateSnapshot, snapshotContext, normalizeThreadId, validHostId, safePath,
+module.exports = { validateSnapshot, snapshotForPeer, snapshotContext, normalizeThreadId, validHostId, safePath,
     MaxSnapshotBytes, StaleAfterMs, FutureSkewMs };

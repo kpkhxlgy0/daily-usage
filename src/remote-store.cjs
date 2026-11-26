@@ -123,18 +123,21 @@ function createRemoteStore({ now = Date.now } = {}) {
                 }
             }));
             const before = await inspect();
-            const capabilities = async () => {
+            const capabilities = async (file = paths.capabilities) => {
                 try {
-                    metadata(await rpc("fs/getMetadata", { path: paths.capabilities }), false, MaxDemandBytes);
-                    const value = decode((await rpc("fs/readFile", { path: paths.capabilities }))?.dataBase64, MaxDemandBytes);
+                    metadata(await rpc("fs/getMetadata", { path: file }), false, MaxDemandBytes);
+                    const value = decode((await rpc("fs/readFile", { path: file }))?.dataBase64, MaxDemandBytes);
                     if (!validateCapabilities(value).ok) throw failure("snapshot-update-required");
                     return value;
                 } catch (error) {
+                    if (signal.aborted || disposed) throw aborted();
+                    if (file === paths.capabilitiesV2) return null;
                     if (error.code === "ENOENT") throw failure("snapshot-update-required");
                     throw error;
                 }
             };
             const peer = await capabilities();
+            const weeklyPeer = await capabilities(paths.capabilitiesV2);
             try {
                 subscription = await bounded(childSignal => {
                     const pending = Promise.resolve(watch(paths.responses, { signal }));
@@ -153,6 +156,7 @@ function createRemoteStore({ now = Date.now } = {}) {
                 throw failure("snapshot-update-required");
             }
             marker = makeMarker(randomUUID(), now());
+            if (weeklyPeer?.publisherId === peer.publisherId) marker.snapshotVersion = 2;
             markerPath = target.pathApi.join(paths.requests, `${marker.requestId}.json`);
             const responsePath = target.pathApi.join(paths.responses, `${marker.requestId}.json`);
             markerAttempted = true;

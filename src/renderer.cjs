@@ -9,6 +9,12 @@ const timeFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai',
     year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
     hourCycle: 'h23' });
 
+const weeklyTime = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+const weeklyDollars = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD',
+    minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const weeklyPercent = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 });
+
 function localDate(milliseconds)
 {
     return new Date(milliseconds + 8 * 3600000).toISOString().slice(0, 10);
@@ -25,6 +31,144 @@ function visibleElement(element)
             || style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility)) return false;
     }
     return true;
+}
+
+function formatWeeklyPercent(value)
+{
+    if (value > 0 && value < 0.1) return '<0.1%';
+    if (value > 99.9 && value < 100) return '>99.9%';
+    return weeklyPercent.format(value) + '%';
+}
+
+function hasWeeklyPrice(row, value)
+{
+    return row.requests === 0 || row.unpricedRequests < row.requests || value > 0;
+}
+
+function weeklyMoney(row, value)
+{
+    if (!hasWeeklyPrice(row, value)) return '—';
+    return weeklyDollars.format(value) + (row.estimatedRequests ? '（含估算）' : '')
+        + (row.unpricedRequests ? ' + 未定价部分' : '');
+}
+
+function renderWeekly(section, snapshot, hostLabel, endLabel)
+{
+    const weekly = snapshot?.weekly;
+    const date = section.querySelector('[data-weekly-period]');
+    const observation = section.querySelector('[data-weekly-observation]');
+    const limit = section.querySelector('progress[aria-label="周额度已用"]');
+    const empty = section.querySelector('[data-weekly-empty]');
+    const coverage = section.querySelector('[data-weekly-coverage]');
+    const updated = section.querySelector('[data-weekly-updated]');
+    const table = section.querySelector('.daily-usage-scroll');
+    const body = table.querySelector('tbody');
+    const rows = weekly?.rows || [];
+    const logCoverage = snapshot?.coverage;
+    const coverageGap = weekly?.startKind === 'observed' || logCoverage?.failedFiles
+        || logCoverage?.skippedRecords || logCoverage?.discoveryErrors || logCoverage?.warnings.length;
+    body.replaceChildren();
+    table.hidden = rows.length === 0;
+    const totals = rows.reduce((sum, row) =>
+    {
+        sum.requests += row.requests;
+        sum.usd += row.usd;
+        sum.unpricedRequests += row.unpricedRequests;
+        sum.estimatedRequests += row.estimatedRequests;
+        return sum;
+    }, { requests: 0, usd: 0, unpricedRequests: 0, estimatedRequests: 0 });
+    section.querySelector('[data-weekly-host]').textContent = hostLabel + '请求数（含子代理）';
+    section.querySelector('[data-weekly-summary="usd"]').textContent = weekly && (rows.length || !coverageGap)
+        ? weeklyMoney(totals, totals.usd) : '—';
+    section.querySelector('[data-weekly-summary="requests"]').textContent = weekly
+        ? counts.format(totals.requests) : '—';
+    const percent = weekly?.usedPercent;
+    const hasPercent = Number.isFinite(percent) && percent >= 0 && percent <= 100;
+    section.querySelector('[data-weekly-summary="percent"]').textContent = hasPercent
+        ? formatWeeklyPercent(percent) : '—';
+    limit.hidden = !hasPercent;
+    limit.value = hasPercent ? percent : 0;
+    observation.textContent = Number.isFinite(weekly?.sampleAt)
+        ? '观测于 ' + weeklyTime.format(weekly.sampleAt) : '';
+    date.textContent = '';
+    updated.textContent = '';
+    coverage.textContent = '';
+    empty.textContent = '';
+    if (!weekly)
+    {
+        if (!snapshot) return;
+        empty.textContent = weekly === null ? '暂无周额度观测记录。'
+            : '运行端旧版 Daily Usage 未提供本轮周额度，请更新后刷新。';
+        return;
+    }
+
+    const startLabel = weekly.startKind === 'reset' ? '重置'
+        : weekly.startKind === 'inferred' ? '按重置时间推算' : '自首次观测';
+    const end = weekly.fullAt === null
+        ? endLabel + ' ' + weeklyTime.format(snapshot.generatedAt)
+        : '首次满额 ' + weeklyTime.format(weekly.fullAt);
+    date.textContent = startLabel + ' ' + weeklyTime.format(weekly.startAt) + ' → ' + end + '（北京时间）'
+        + (weekly.startKind === 'observed' ? ' · 部分覆盖' : '');
+    if (weekly.fullAt !== null)
+    {
+        updated.textContent = endLabel + ' ' + weeklyTime.format(snapshot.generatedAt) + '（北京时间）';
+    }
+    if (!rows.length)
+    {
+        empty.textContent = hostLabel + '可读日志范围内，本轮没有可统计的请求。'
+            + (coverageGap ? '已有覆盖缺口，金额暂不可用。' : '');
+    }
+
+    const gaps = [];
+    if (totals.unpricedRequests)
+    {
+        gaps.push(counts.format(totals.unpricedRequests) + ' 次请求未定价'
+            + (totals.usd > 0 ? '，金额占比按已定价金额计算' : ''));
+    }
+    if (totals.estimatedRequests) gaps.push(counts.format(totals.estimatedRequests) + ' 次请求含估算');
+    const scanWarnings = [...logCoverage.warnings];
+    if (!scanWarnings.length)
+    {
+        if (logCoverage.failedFiles) scanWarnings.push(logCoverage.failedFiles + ' 个日志读取失败');
+        if (logCoverage.skippedRecords) scanWarnings.push(logCoverage.skippedRecords + ' 条记录无法归属');
+    }
+    if (scanWarnings.length) gaps.push('近 30 天日志扫描 · ' + scanWarnings.join(' '));
+    coverage.textContent = gaps.join('；');
+    const doc = section.ownerDocument;
+    const orderedRows = [...rows].sort((a, b) => b.usd - a.usd || a.model.localeCompare(b.model));
+    for (const row of orderedRows)
+    {
+        const tr = doc.createElement('tr');
+        const rowUsd = weeklyMoney(row, row.usd);
+        const share = hasWeeklyPrice(row, row.usd) && Number.isFinite(totals.usd) && totals.usd > 0
+            ? row.usd / totals.usd * 100 : null;
+        const base = hasWeeklyPrice(row, row.baseUsd) ? weeklyDollars.format(row.baseUsd) : '—';
+        const values = [row.model, counts.format(row.requests), base, rowUsd];
+        for (const value of values)
+        {
+            const cell = doc.createElement('td');
+            cell.textContent = value;
+            tr.append(cell);
+        }
+        const shareCell = doc.createElement('td');
+        if (share === null)
+        {
+            shareCell.textContent = '—';
+        }
+        else
+        {
+            const indicator = doc.createElement('span');
+            indicator.className = 'daily-usage-share';
+            const bar = doc.createElement('progress');
+            bar.max = 100;
+            bar.value = share;
+            bar.setAttribute('aria-hidden', 'true');
+            indicator.append(bar, formatWeeklyPercent(share));
+            shareCell.append(indicator);
+        }
+        tr.append(shareCell);
+        body.append(tr);
+    }
 }
 
 function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = Date.now })
@@ -63,12 +207,24 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         .daily-usage-panel th:nth-child(2), .daily-usage-panel td:nth-child(2) { text-align:left; }
         .daily-usage-panel th { font-weight:600; }
         .daily-usage-panel [data-status] { min-height:22px; }
+
+        .daily-usage-panel .daily-usage-period { font-size:14px; font-weight:600; overflow-wrap:anywhere; }
+        .daily-usage-weekly .daily-usage-card { min-width:min(100%, 185px); overflow-wrap:anywhere; }
+        .daily-usage-weekly .daily-usage-card small:last-child { margin:4px 0 0; }
+        .daily-usage-weekly progress { width:100%; height:8px; accent-color:#229982; }
+        .daily-usage-weekly caption { text-align:left; font-size:16px; font-weight:600; padding:0 0 8px; }
+        .daily-usage-weekly :is(th, td):nth-child(4) { font-weight:700; background:#22998214; }
+        .daily-usage-share { display:inline-flex; align-items:center; gap:8px; }
+        .daily-usage-share progress { width:clamp(64px, 12vw, 128px); height:6px; }
+        .daily-usage-weekly td:first-child { white-space:normal; overflow-wrap:anywhere; min-width:100px; }
+        .daily-usage-panel .daily-usage-weekly :is(th, td):nth-child(2) { text-align:right; }
     </style>
     <header><h2>Daily Usage</h2><select aria-label="统计机器"><option value="local">本机</option></select>
     <select aria-label="统计时间范围"><option value="1">今天</option><option value="7">最近 7 天</option>
-    <option value="30">最近 30 天</option></select><button type="button" data-refresh>刷新</button></header>
-    <p>北京时间 · 包含子代理 · 按公开 Standard API 基础单价折算，不叠加长上下文或缓存保留时长加价；缓存写入按普通输入价计一次，金额不代表订阅账单。</p>
+    <option value="30">最近 30 天</option><option value="weekly">本轮周额度</option></select><button type="button" data-refresh>刷新</button></header>
+    <p data-calendar-note>北京时间 · 包含子代理 · 按公开 Standard API 基础单价折算，不叠加长上下文或缓存保留时长加价；缓存写入按普通输入价计一次，金额不代表订阅账单。</p>
     <div data-status role="status" aria-live="polite">正在读取统计…</div>
+    <div data-calendar>
     <div class="daily-usage-cards">
         <div class="daily-usage-card"><small>Token 总量</small><strong data-summary="tokens">—</strong></div>
         <div class="daily-usage-card"><small>费用估算（USD）</small><strong data-summary="usd">—</strong></div>
@@ -78,13 +234,38 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
     <th>日期</th><th>模型</th><th>请求</th><th>普通输入</th><th>缓存输入</th><th>缓存写入</th><th>输出</th><th>费用估算（USD）</th>
     </tr></thead><tbody></tbody></table></div>
     <p data-empty></p><p>机器列表包含本机和本窗口打开过的远程会话。远程机器需要安装并启用 Daily Usage。</p>
-    <p data-price></p>`;
+    <p data-price></p></div>
+    <div class="daily-usage-weekly" data-weekly hidden>
+        <p class="daily-usage-period" data-weekly-period></p>
+        <div class="daily-usage-cards">
+            <div class="daily-usage-card"><small>API 等价金额（USD）</small><strong data-weekly-summary="usd">—</strong>
+                <small>Standard 含长上下文</small></div>
+            <div class="daily-usage-card"><small>周额度已用</small><strong data-weekly-summary="percent">—</strong>
+                <progress aria-label="周额度已用" max="100" value="0" hidden></progress>
+                <p data-weekly-observation></p></div>
+            <div class="daily-usage-card"><small data-weekly-host>本机请求数（含子代理）</small>
+                <strong data-weekly-summary="requests">—</strong></div>
+        </div>
+        <p data-weekly-empty role="status"></p>
+        <div class="daily-usage-scroll" role="region" aria-label="模型费用列表" tabindex="0" hidden>
+            <table aria-label="本轮周额度模型用量">
+                <caption>按模型统计</caption><thead><tr>
+                <th scope="col">模型</th><th scope="col">请求数</th><th scope="col">基础价（USD）</th>
+                <th scope="col" aria-sort="descending">含长上下文（USD）</th><th scope="col">金额占比</th>
+            </tr></thead><tbody></tbody></table>
+        </div>
+        <p data-weekly-updated></p><p data-weekly-coverage></p>
+        <p>周额度显示最近一次观测值。费用按 Standard API 价格折算，订阅账单以服务商为准。</p>
+    </div>`;
     root.append(panel);
     const host = panel.querySelector('[aria-label="统计机器"]');
     const range = panel.querySelector('[aria-label="统计时间范围"]');
     const refresh = panel.querySelector('[data-refresh]');
     const status = panel.querySelector('[data-status]');
-    const body = panel.querySelector('tbody');
+    const calendar = panel.querySelector('[data-calendar]');
+    const calendarNote = panel.querySelector('[data-calendar-note]');
+    const weekly = panel.querySelector('[data-weekly]');
+    const body = calendar.querySelector('tbody');
 
     function render()
     {
@@ -92,6 +273,25 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         body.replaceChildren();
         const snapshot = reportState?.snapshot;
         const state = reportState?.status;
+        const stale = snapshot && (state === 'stale' || state === 'error' || now() - snapshot.generatedAt > 180000);
+        const hostLabel = hostNames.get(host.value) || host.value;
+        status.textContent = reportState?.error === 'snapshot-update-required'
+            ? '请在查看端和运行端安装并启用同一新版 Daily Usage，并确认 Codex 支持文件通知。'
+            : state === 'loading' ? '正在查询所选机器，完成后显示结果…'
+            : stale ? '显示最后成功的缓存数据；当前连接不可用或统计尚未更新。'
+            : snapshot ? `${hostLabel} · 统计已更新`
+            : state === 'error' && host.value === 'local' ? '本机统计暂不可用，请稍后刷新。'
+            : '暂无统计。请在运行端安装并启用 Daily Usage，并等待首次扫描完成。';
+        const showWeekly = range.value === 'weekly';
+        calendar.hidden = calendarNote.hidden = showWeekly;
+        if (!weekly.hidden && !showWeekly) weekly.querySelector('tbody').replaceChildren();
+        weekly.hidden = !showWeekly;
+        if (showWeekly)
+        {
+            const endLabel = stale ? '缓存截至' : state === 'loading' ? '上次数据截至' : '当前 · 数据截至';
+            renderWeekly(weekly, snapshot, hostLabel, endLabel);
+            return;
+        }
         const from = localDate(now() - (Number(range.value) - 1) * DayMs);
         const to = localDate(now());
         const rows = snapshot?.rows.filter(row => row.date >= from && row.date <= to) || [];
@@ -105,14 +305,6 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
                 ? (key === 'usd' ? (totals.requests && totals.unpriced === totals.requests && totals.usd === 0 ? '未定价'
                     : dollars.format(totals.usd)) : counts.format(totals[key])) : '—';
         }
-        const stale = snapshot && (state === 'stale' || state === 'error' || now() - snapshot.generatedAt > 180000);
-        status.textContent = reportState?.error === 'snapshot-update-required'
-            ? '请在查看端和运行端安装并启用同一新版 Daily Usage，并确认 Codex 支持文件通知。'
-            : state === 'loading' ? '正在查询所选机器，完成后显示结果…'
-            : stale ? '显示最后成功的缓存数据；当前连接不可用或统计尚未更新。'
-            : snapshot ? `${hostNames.get(host.value) || host.value} · 统计已更新`
-            : state === 'error' && host.value === 'local' ? '本机统计暂不可用，请稍后刷新。'
-            : '暂无统计。请在运行端安装并启用 Daily Usage，并等待首次扫描完成。';
         panel.querySelector('[data-updated]').textContent = snapshot
             ? `数据截至 ${timeFormat.format(snapshot.generatedAt)}（北京时间） · 已读取 ${snapshot.from} 至 ${snapshot.to}` : '';
         const gaps = [];
@@ -268,7 +460,7 @@ function startRenderer(api, { window: win = window, document: doc = document } =
         return cleanup;
     }
     const page = api.settings?.registerPage({ id: 'daily-usage', title: 'Daily Usage',
-        description: '每日 Token 与费用估算（USD）', iconSvg: PageIconSvg, render: mount });
+        description: '每日 Token、费用估算（USD）与本轮周额度', iconSvg: PageIconSvg, render: mount });
     let discovering = false;
     let rediscover = false;
     let queued = false;

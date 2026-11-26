@@ -84,6 +84,42 @@ async function waitFor(read, predicate = Boolean)
 // Close the observer's handle before the publisher can replace a response on Windows.
 const response = (paths, id) => JSON.parse(nativeFs.readFileSync(path.join(paths.responses, `${id}.json`), 'utf8'));
 
+test('a blocked optional weekly advertisement leaves daily queries usable', async t =>
+{
+    const { paths, calls } = await setup(t, { beforeStart: p => fs.mkdir(p.capabilitiesV2) });
+    assert.equal(validateCapabilities(JSON.parse(await fs.readFile(paths.capabilities, 'utf8'))).ok, true);
+    const marker = makeMarker(randomUUID(), Date.now());
+    await write(paths, marker);
+    await waitFor(() => Promise.resolve(calls.length), count => count === 1);
+    calls[0].resolve({ status: 'ok', snapshot: { ...report(), schemaVersion: 2, weekly: null } });
+    const result = await waitFor(() => response(paths, marker.requestId), value => value.status === 'ok');
+    assert.equal(result.snapshot.schemaVersion, 1);
+    assert.equal((await fs.lstat(paths.capabilitiesV2)).isDirectory(), true);
+});
+
+test('new runners return a weekly snapshot only when the requester supports it', async t =>
+{
+    const { paths, calls } = await setup(t);
+    const legacyCaps = JSON.parse(await fs.readFile(paths.capabilities, 'utf8'));
+    assert.deepEqual(JSON.parse(await fs.readFile(paths.capabilitiesV2, 'utf8')), legacyCaps);
+    const now = Date.now();
+    const weekly = { startAt: now - 1000, startKind: 'observed', fullAt: null,
+        sampleAt: now, usedPercent: 42, rows: [] };
+    const local = { ...report(), generatedAt: now, schemaVersion: 2, weekly };
+    for (const snapshotVersion of [1, 2])
+    {
+        const marker = makeMarker(randomUUID(), Date.now());
+        if (snapshotVersion === 2) marker.snapshotVersion = 2;
+        await write(paths, marker);
+        await waitFor(() => Promise.resolve(calls.length), count => count === snapshotVersion);
+        calls.at(-1).resolve({ status: 'ok', snapshot: local });
+        const result = await waitFor(() => response(paths, marker.requestId), value => value.status === 'ok');
+        assert.equal(result.snapshot.schemaVersion, snapshotVersion);
+        assert.deepEqual(result.snapshot.weekly, snapshotVersion === 2 ? weekly : undefined);
+    }
+    assert.deepEqual(local.weekly, weekly);
+});
+
 test('native watcher advertises ready then runs exactly one query per fresh marker and leaves idle unchanged', async t =>
 {
     const oldMarker = makeMarker(randomUUID(), Date.now());
