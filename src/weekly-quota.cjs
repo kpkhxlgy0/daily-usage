@@ -26,26 +26,41 @@ function laterReading(sampleAt, usedPercent, reading)
     return !reading || sampleAt > reading.sampleAt || sampleAt === reading.sampleAt && usedPercent > reading.usedPercent;
 }
 
+function weeklyReadings(limits, sampleAt)
+{
+    if (!limits || (limits.limit_id != null && limits.limit_id !== 'codex')) return [];
+    const readings = [];
+    for (const window of [limits.primary, limits.secondary])
+    {
+        if (window?.window_minutes !== WeekMinutes || !Number.isSafeInteger(window.resets_at)
+            || !validPercent(window.used_percent)) continue;
+        const resetAt = window.resets_at * 1000;
+        if (validTimestamp(resetAt) && inCycle(sampleAt, resetAt))
+            readings.push({ resetAt, usedPercent: window.used_percent });
+    }
+    return readings;
+}
+
+function sameCycle(first, second)
+{
+    return Math.abs(first - second) <= ResetObservationGraceMs;
+}
+
 function createWeeklyObservations(minTimestamp, maxTimestamp)
 {
     const byReset = new Map();
     let nextWeeklyAt = null;
     return {
-        observe(limits, sampleAt)
+        observe(readings, sampleAt)
         {
-            if (!limits || (limits.limit_id != null && limits.limit_id !== 'codex') || sampleAt < minTimestamp) return;
-            for (const window of [limits.primary, limits.secondary])
+            for (const { resetAt, usedPercent } of readings)
             {
-                if (window?.window_minutes !== WeekMinutes || !Number.isSafeInteger(window.resets_at)
-                    || !validPercent(window.used_percent)) continue;
-                const resetAt = window.resets_at * 1000;
-                if (!validTimestamp(resetAt) || !inCycle(sampleAt, resetAt)) continue;
+                if (resetAt <= minTimestamp) continue;
                 if (sampleAt > maxTimestamp)
                 {
                     if (nextWeeklyAt === null || sampleAt < nextWeeklyAt) nextWeeklyAt = sampleAt;
                     continue;
                 }
-                const usedPercent = window.used_percent;
                 let sample = byReset.get(resetAt);
                 if (!sample)
                 {
@@ -112,144 +127,105 @@ function latestObservation(samples)
     return latest;
 }
 
-function summarizeWindow(samples, latest = latestObservation(samples))
+function summarizeWindow(samples, resetAt, priorResetAt, generatedAt, cutoff)
 {
+    const latest = latestObservation(samples);
     let firstAt = Infinity;
     let zeroAt = Infinity;
     let fullAt = Infinity;
-    let earliestResetAt = latest.resetAt;
     for (const sample of samples)
     {
-        earliestResetAt = Math.min(earliestResetAt, sample.resetAt);
         firstAt = Math.min(firstAt, sample.firstAt);
         if (sample.zeroAt !== null) zeroAt = Math.min(zeroAt, sample.zeroAt);
         if (sample.fullAt !== null) fullAt = Math.min(fullAt, sample.fullAt);
     }
-    let startAt = earliestResetAt - WeekMs;
+    let startAt = resetAt - WeekMs;
     let startKind = 'inferred';
-    // 重置后短时间内的归零可确认边界，较迟的首条归零仍使用重置时间推算。
-    if (zeroAt === firstAt && zeroAt <= startAt + ResetObservationGraceMs)
+    // 归零样本可能迟到，不能覆盖已经推算或观察到的较早起点。
+    if (priorResetAt !== undefined)
     {
-        startAt = zeroAt;
+        startAt = priorResetAt;
         startKind = 'reset';
     }
-    else if (firstAt < startAt)
+    if (firstAt < startAt || firstAt === startAt && zeroAt === firstAt)
     {
         startAt = firstAt;
-        startKind = 'observed';
+        startKind = zeroAt === firstAt ? 'reset' : 'observed';
     }
-    const window = { startAt, startKind, fullAt: Number.isFinite(fullAt) ? fullAt : null,
-        usedPercent: Number.isFinite(fullAt) ? 100 : latest.usedPercent, sampleAt: latest.sampleAt };
-    return { window, firstAt, initialStartAt: startAt, earliestResetAt };
+    return { startAt, resetAt, endAt: Math.min(resetAt - 1, generatedAt), startKind,
+        fullAt: Number.isFinite(fullAt) ? fullAt : null, sampleAt: latest?.sampleAt ?? null,
+        usedPercent: latest?.usedPercent ?? null, partial: startAt < cutoff };
 }
 
-function observationBeforeReset(sample, resetAt, cutoff)
+function observationBeforeReset(sample, resetAt)
 {
     if (sample.sampleAt < resetAt) return sample;
     // 同轮重置时间有抖动时，只保留能确认在最早边界之前的读数。
     const fullAt = sample.fullAt !== null && sample.fullAt < resetAt ? sample.fullAt : null;
     const zeroAt = sample.zeroAt !== null && sample.zeroAt < resetAt ? sample.zeroAt : null;
     const sampleAt = Math.max(fullAt ?? 0, zeroAt ?? 0, sample.beforeJitter?.sampleAt ?? 0);
-    if (!sampleAt || sampleAt < cutoff) return null;
+    if (!sampleAt) return null;
     const usedPercent = sampleAt === fullAt ? 100 : sampleAt === zeroAt ? 0 : sample.beforeJitter.usedPercent;
     return { ...sample, sampleAt, fullAt, zeroAt, usedPercent };
 }
 
-function fullWeeksBetween(newerResetAt, olderResetAt)
+function weeklyWindows(sources, generatedAt, cutoff)
 {
-    return Math.floor((newerResetAt - olderResetAt + ResetObservationGraceMs) / WeekMs);
-}
-
-function historicalWindows(samples, current, generatedAt, cutoff)
-{
+    const rawResets = new Map();
+    const sourceOf = new Map();
+    for (const source of sources)
+    {
+        for (const sample of source.weeklySamples)
+        {
+            if (sample.resetAt <= cutoff) continue;
+            const readings = rawResets.get(sample.resetAt) || [];
+            readings.push(sample);
+            rawResets.set(sample.resetAt, readings);
+            sourceOf.set(sample, source);
+        }
+    }
+    const latest = latestObservation(sourceOf.keys());
     const groups = [];
-    for (const sample of samples.sort((a, b) => b.resetAt - a.resetAt))
+    function continuous(first, second)
+    {
+        if (sourceOf.get(first) !== sourceOf.get(second)) return false;
+        if (first.sampleAt === second.sampleAt) return first.usedPercent === second.usedPercent;
+        return first.sampleAt < second.sampleAt ? first.usedPercent <= second.usedPercent : second.usedPercent <= first.usedPercent;
+    }
+    for (const [resetAt, readings] of [...rawResets].sort(([first], [second]) => second - first))
     {
         let group = groups.at(-1);
-        if (!group || group[0].resetAt - sample.resetAt > ResetObservationGraceMs)
+        // 五秒以上的差距只在同一日志中存在连续百分比读数时合并。
+        if (!group || !sameCycle(group[0].resetAt, resetAt) || (group[0].resetAt - resetAt > ResetJitterMs
+            && !readings.some(reading => group.some(sample => continuous(sample, reading)))))
         {
             group = [];
             groups.push(group);
         }
-        group.push(sample);
+        group.push(...readings);
     }
 
-    const candidates = [];
+    const windows = [];
+    const byReset = new Map();
+    let current = null;
+    const distinctResets = groups.map(group => group.at(-1).resetAt);
     for (const group of groups)
     {
-        if (group[0].resetAt > generatedAt) continue;
-        const earliestResetAt = group.at(-1).resetAt;
-        const observed = group.map(sample => observationBeforeReset(sample, earliestResetAt, cutoff)).filter(Boolean);
-        if (observed.length) candidates.push({ ...summarizeWindow(observed), earliestResetAt });
+        const resetAt = group.at(-1).resetAt;
+        const observed = group.map(sample => observationBeforeReset(sample, resetAt)).filter(Boolean);
+        const inferredStart = resetAt - WeekMs;
+        const priorResetAt = distinctResets.find(reset => inferredStart - ResetJitterMs <= reset && reset <= inferredStart);
+        const window = summarizeWindow(observed, resetAt, priorResetAt, generatedAt, cutoff);
+        if (!observed.length) window.partial = true;
+        windows.push(window);
+        for (const sample of group) byReset.set(sample.resetAt, window);
+        if (resetAt > generatedAt && group.includes(latest)) current = window;
     }
-    candidates.sort((a, b) => b.window.sampleAt - a.window.sampleAt || b.earliestResetAt - a.earliestResetAt);
-    const history = [];
-    const disputedResets = [];
-    let newer = current;
-    for (const candidate of candidates)
-    {
-        const { window, earliestResetAt } = candidate;
-        if (newer && earliestResetAt >= newer.earliestResetAt - ResetObservationGraceMs) continue;
-
-        const nextStart = newer?.initialStartAt ?? generatedAt + 1;
-        const overlap = earliestResetAt - nextStart > ResetObservationGraceMs;
-        if (overlap)
-        {
-            if (newer !== current) newer.window.partial = true;
-            if (newer.window.startKind === 'inferred')
-            {
-                newer.window.startAt = window.sampleAt < newer.firstAt ? newer.firstAt
-                    : newer.window.fullAt ?? newer.window.sampleAt;
-                newer.window.startKind = 'observed';
-            }
-        }
-
-        // 两个周期的采样无法放进互斥窗口时，较早的窗口没有可信结束时间。
-        if (window.sampleAt >= nextStart)
-        {
-            if (overlap) disputedResets.push(earliestResetAt);
-            continue;
-        }
-        if (history.length === HistoryLimit) break;
-        let endAt = Math.min(earliestResetAt, nextStart) - 1;
-        if (overlap && newer?.window.startKind !== 'reset') endAt = window.sampleAt;
-
-        let missing = newer
-            ? Math.max(0, fullWeeksBetween(newer.earliestResetAt, earliestResetAt) - 1)
-            : Math.floor((generatedAt - earliestResetAt) / WeekMs);
-        // 若争议重置与更早的可信重置相隔至少一轮，保留其位置。接近的备选重置不占额外列。
-        for (const resetAt of disputedResets)
-        {
-            const distance = fullWeeksBetween(resetAt, earliestResetAt);
-            if (distance <= 0) continue;
-            const preceding = Math.max(0, fullWeeksBetween(newer.earliestResetAt, resetAt) - 1);
-            missing = Math.max(missing, distance + preceding);
-        }
-        for (let offset = 0; offset < missing && history.length < HistoryLimit; offset++) history.push(null);
-        if (history.length === HistoryLimit) break;
-
-        const period = { ...window, endAt, partial: window.startAt < cutoff || overlap };
-        history.push(period);
-        newer = { ...candidate, window: period };
-        disputedResets.length = 0;
-    }
-    return history;
+    // 切换账号后另一轮配额仍可能开放，历史列按独立周期的重置时间保留它。
+    const otherWindows = windows.filter(window => window !== current);
+    const history = otherWindows.slice(0, HistoryLimit);
+    const older = new Set(otherWindows.slice(HistoryLimit).filter(window => window.resetAt <= generatedAt));
+    return { current, history, older, windows, byReset };
 }
 
-function weeklyWindows(sources, generatedAt, cutoff)
-{
-    const samples = sources.flatMap(source => source.weeklySamples)
-        .filter(sample => sample.sampleAt >= cutoff);
-    const latest = latestObservation(samples);
-    if (!latest) return { current: null, history: [] };
-
-    // 秒级的重置抖动可以共用起点和用满样本。是否仍为当前周期沿用原来的较窄容差。
-    const sameCycle = sample => Math.abs(sample.resetAt - latest.resetAt) <= ResetObservationGraceMs;
-    const current = samples.some(sample => sample.resetAt > generatedAt
-        && Math.abs(sample.resetAt - latest.resetAt) <= ResetJitterMs)
-        ? summarizeWindow(samples.filter(sameCycle), latest) : null;
-    const historical = current ? samples.filter(sample => !sameCycle(sample)) : samples;
-    return { current: current?.window ?? null, history: historicalWindows(historical, current, generatedAt, cutoff) };
-}
-
-module.exports = { createWeeklyObservations, validWeeklyData, weeklyWindows };
+module.exports = { createWeeklyObservations, sameCycle, validWeeklyData, weeklyReadings, weeklyWindows };

@@ -15,6 +15,7 @@ function body()
 {
     return { generatedAt: Date.parse('2026-11-16T12:00:00Z'), timezone: 'Asia/Shanghai',
         from: '2026-10-18', to: '2026-11-16', rows: [],
+        weekly: null, weeklyHistory: [], weeklyRemainder: { earlier: { requests: 0, usd: 0 }, unassigned: { requests: 0, usd: 0 } },
         coverage: { files: 1, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
         pricing: { ...Pricing } };
 }
@@ -75,6 +76,7 @@ test('startup and idle never create a collector; each query awaits a fresh termi
     const report = JSON.parse(await fs.readFile(path.join(root, '.daily-usage/summary.json'), 'utf8'));
     assert.equal(report.source, 'com.kpk.daily-usage');
     assert.equal(report.revision, 1);
+    assert.equal(report.schemaVersion, 4);
     const second = await started(service, workers);
     assert.equal(workers.length, 2);
     second.worker.emit('message', { type: 'result', report: body() });
@@ -94,8 +96,9 @@ test('startup and idle never create a collector; each query awaits a fresh termi
     assert.equal(next.getState().status, 'stale');
 });
 
-for (const basis of ['standard', 'standard-base-api', 'codex-base-estimate'])
-test(`startup rejects ${basis} pricing without scanning and demand reprices the same raw cache`, async t =>
+for (const [basis, asOf] of [['standard', '2026-11-16'], ['standard-base-api', '2026-11-16'],
+    ['codex-base-estimate', '2026-11-16'], ['codex-base-estimate', '2026-11-18']])
+test(`startup rejects ${basis} ${asOf} pricing without scanning and demand reprices the same raw cache`, async t =>
 {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'daily-usage-pricing-migration-'));
     const directory = path.join(root, '.daily-usage');
@@ -107,9 +110,10 @@ test(`startup rejects ${basis} pricing without scanning and demand reprices the 
     const row = { date, model: 'gpt-6.1-sol', requests: 1, inputTokens: 300000,
         uncachedInputTokens: 200000, cachedInputTokens: 0, cacheWriteTokens: 100000, outputTokens: 1000,
         usd: 0.66, unpricedRequests: 0, estimatedRequests: 0 };
-    const legacy = { ...body(), schemaVersion: 1, source: 'com.kpk.daily-usage', machineId,
+    const { weeklyRemainder, ...legacyFields } = body();
+    const legacy = { ...legacyFields, schemaVersion: 3, source: 'com.kpk.daily-usage', machineId,
         publisherId: '33333333-3333-4333-8333-333333333333', revision: 7, from: date, to: date, rows: [row],
-        pricing: { ...body().pricing, basis, asOf: '2026-11-16' } };
+        pricing: { ...body().pricing, basis, asOf } };
     const original = JSON.stringify(legacy);
     await fs.mkdir(directory);
     await fs.writeFile(path.join(directory, 'machine.json'), JSON.stringify({ machineId }));
@@ -151,8 +155,9 @@ test(`startup rejects ${basis} pricing without scanning and demand reprices the 
     assert.equal(state.status, 'ok', JSON.stringify(state));
     assert.equal(workers.length, 1);
     assert.equal(state.snapshot.machineId, machineId);
-    assert.equal(state.snapshot.pricing.basis, 'codex-base-estimate');
-    assert.deepEqual(state.snapshot.rows, [{ ...row, usd: 0.61 }]);
+    assert.equal(state.snapshot.pricing.basis, 'codex-standard-estimate');
+    assert.deepEqual(state.snapshot.rows, [{ ...row, usd: 1.315 }]);
+    assert.deepEqual(state.snapshot.weeklyRemainder.unassigned, { requests: 1, usd: 1.315 });
     assert.equal(state.snapshot.coverage.cachedFiles, 1);
     assert.equal(state.snapshot.coverage.parsedFiles, 0);
     assert.equal(await fs.readFile(cacheFile, 'utf8'), rawCache);

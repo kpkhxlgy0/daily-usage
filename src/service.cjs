@@ -6,7 +6,7 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { Worker } = require('node:worker_threads');
 const { setTimeout: delay } = require('node:timers/promises');
-const { validateSnapshot, snapshotWithinLimit, MaxSnapshotBytes, normalizeThreadId } = require('./protocol.cjs');
+const { validateSnapshot, MaxSnapshotBytes, normalizeThreadId } = require('./protocol.cjs');
 
 const SharingRetryMs = 25;
 
@@ -154,10 +154,10 @@ function createService({ codexHome, dataDir, now = Date.now,
                     publishing = publishing.then(async () =>
                     {
                         if (!active(job)) return;
-                        const snapshot = snapshotWithinLimit({ weekly: null, weeklyHistory: [], ...message.report,
-                            schemaVersion: 3, source: 'com.kpk.daily-usage', machineId, publisherId,
-                            revision: revision + 1 }, { now: now() });
-                        if (!snapshot) throw new Error('invalid-report');
+                        const snapshot = { ...message.report, schemaVersion: 4, source: 'com.kpk.daily-usage',
+                            machineId, publisherId, revision: revision + 1 };
+                        const checked = validateSnapshot(snapshot, { now: now(), minVersion: 4 });
+                        if (!checked.ok) throw new Error(checked.reason === 'size' ? 'snapshot-too-large' : 'invalid-report');
                         await atomicWrite(reportFile, snapshot, () => active(job), job.controller.signal);
                         await complete(job, null, snapshot);
                     }).catch(error => complete(job, error));
@@ -204,7 +204,7 @@ function createService({ codexHome, dataDir, now = Date.now,
         try
         {
             const previous = await readJson(reportFile);
-            if (validateSnapshot(previous, { now: now() }).ok && previous.machineId === machineId)
+            if (validateSnapshot(previous, { now: now(), minVersion: 4 }).ok && previous.machineId === machineId)
                 state = { status: 'stale', snapshot: previous, progress: null };
         }
         catch { /* 缓存损坏时仅在查询时重新统计，不改写原始日志。 */ }

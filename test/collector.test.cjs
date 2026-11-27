@@ -79,6 +79,31 @@ async function fixture(t)
     return { home, cacheDir, write, collector };
 }
 
+function mutateAfterFirstRead(t, filename, mutate)
+{
+    const open = fs.open;
+    let changed = false;
+    t.mock.method(fs, 'open', async (...args) =>
+    {
+        const handle = await open(...args);
+        if (args[0] === filename && !changed)
+        {
+            const read = handle.read.bind(handle);
+            handle.read = async (...readArgs) =>
+            {
+                const result = await read(...readArgs);
+                if (!changed)
+                {
+                    changed = true;
+                    await mutate();
+                }
+                return result;
+            };
+        }
+        return handle;
+    });
+}
+
 test('modern paid requests survive discarded context and deduplicate globally across forks and archives', async t =>
 {
     const f = await fixture(t);
@@ -94,7 +119,7 @@ test('modern paid requests survive discarded context and deduplicate globally ac
         inputTokens: 3000, uncachedInputTokens: 2400, cachedInputTokens: 600, cacheWriteTokens: 0,
         outputTokens: 300, usd: 0.00786, unpricedRequests: 0, estimatedRequests: 0 });
     assert.equal(report.coverage.duplicateRequests, 1);
-    assert.equal(report.pricing.basis, 'codex-base-estimate');
+    assert.equal(report.pricing.basis, 'codex-standard-estimate');
 });
 
 test('sanitized native usage and paired token_count count once with no false coverage gap', async t =>
@@ -112,7 +137,7 @@ test('sanitized native usage and paired token_count count once with no false cov
     assert.deepEqual(report.coverage.warnings, []);
 });
 
-test('pre-native-parser schema cache is invalidated rather than returning stale missing modern usage', async t =>
+test('prior parsed-usage cache without response associations is rebuilt from the logs', async t =>
 {
     const f = await fixture(t);
     await f.write('sessions/schema.jsonl', [meta('root'), context('turn-1'), modern('native')]);
@@ -123,16 +148,15 @@ test('pre-native-parser schema cache is invalidated rather than returning stale 
     const [name] = await fs.readdir(directory);
     const filename = path.join(directory, name);
     const cached = JSON.parse(await fs.readFile(filename, 'utf8'));
-    cached.schemaVersion = 1;
-    cached.data.modern = [];
-    cached.data.modernThreads = [];
+    cached.schemaVersion = 3;
+    delete cached.data.modern[0].weeklyResets;
     await fs.writeFile(filename, JSON.stringify(cached));
     const report = await f.collector().scan();
     assert.equal(report.rows[0].requests, 1);
     assert.equal(report.coverage.parsedFiles, 1);
 });
 
-test('unchanged parsed usage caches are reused and long requests are repriced at base rates', async t =>
+test('unchanged parsed usage caches are reused and long requests keep the Standard price', async t =>
 {
     const f = await fixture(t);
     await f.write('sessions/long-context.jsonl', [meta('root'), context('turn-1', 'gpt-6-astra'),
@@ -144,8 +168,8 @@ test('unchanged parsed usage caches are reused and long requests are repriced at
     assert.equal(report.coverage.cachedFiles, 1);
     assert.equal(report.coverage.parsedFiles, 0);
     assert.equal(report.rows[0].inputTokens, 300000);
-    assert.equal(report.rows[0].usd, 0.53);
-    assert.equal(report.pricing.basis, 'codex-base-estimate');
+    assert.equal(report.rows[0].usd, 1.035);
+    assert.equal(report.pricing.basis, 'codex-standard-estimate');
 });
 
 test('models resolve by matching turn rather than last context and child session_id is not source identity', async t =>
@@ -341,19 +365,20 @@ test('an uncorroborated legacy request between modern responses remains a real c
     assert.match(report.coverage.warnings.join(' '), /旧版.*逐请求/);
 });
 
-test('one modern response corroborates one distinct offset counter while exact counter replay stays informational',
+test('a single modern response cannot corroborate an offset even with equivalent counter retries',
     async t =>
 {
     const f = await fixture(t);
     await f.write('sessions/consumed-offset.jsonl', [meta('root'), context('turn-1'),
-        modern('one-response', { cached: 0 }),
+        modern('one-response', { cached: 0,
+            thread_token_usage: { input_tokens: 1000, cached_input_tokens: 0, output_tokens: 100 } }),
         legacy(5000, 500, { timestamp: '2026-11-16T10:00:01Z', last: [1000, 100] }),
         legacy(6000, 600, { timestamp: '2026-11-16T10:00:02Z', last: [1000, 100] }),
         legacy(5000, 500, { timestamp: '2026-11-16T10:00:03Z', last: [1000, 100] })]);
     const report = await f.collector().scan();
     assert.equal(report.rows[0].requests, 1);
-    assert.equal(report.coverage.redundantLegacyRecords, 2);
-    assert.equal(report.coverage.legacySkippedRecords, 1);
+    assert.equal(report.coverage.redundantLegacyRecords, 0);
+    assert.equal(report.coverage.legacySkippedRecords, 3);
     assert.match(report.coverage.warnings.join(' '), /旧版.*逐请求/);
 });
 
@@ -430,14 +455,15 @@ test('native child legacy sources remain independent despite sharing the root se
     assert.equal(report.rows[0].inputTokens, 300);
 });
 
-test('missing cache write TTL keeps distinct token categories and prices input once', async t =>
+test('missing cache write TTL uses the estimated Standard write rate and keeps distinct token categories', async t =>
 {
     const f = await fixture(t);
     await f.write('sessions/write.jsonl', [meta('root'), context('turn-1'), modern('write', { write: 100 })]);
     const report = await f.collector().scan();
     assert.equal(report.rows[0].uncachedInputTokens, 700);
     assert.equal(report.rows[0].cacheWriteTokens, 100);
-    assert.equal(report.rows[0].usd, 0.00262);
+    assert.equal(report.rows[0].usd, 0.00267);
+    assert.equal(report.rows[0].estimatedRequests, 1);
     assert.equal(report.rows[0].unpricedRequests, 0);
     assert.deepEqual(report.coverage.warnings, []);
 });
@@ -472,6 +498,48 @@ test('persistent per-file metadata cache avoids reparsing, refreshes on append, 
     assert.equal(report.coverage.parsedFiles, 1);
     assert.equal(report.rows[0].requests, 2);
 });
+
+test('a growing plain rollout contributes its complete initial records without caching the partial scan', async t =>
+{
+    const f = await fixture(t);
+    const next = JSON.stringify(modern('append'));
+    const filename = await f.write('sessions/growing.jsonl', [meta('root'), context('turn-1'), modern('initial')]);
+    await fs.appendFile(filename, next.slice(0, 32));
+    mutateAfterFirstRead(t, filename, () => fs.appendFile(filename, next.slice(32) + '\n'));
+    const collector = f.collector();
+    const first = await collector.scan();
+    assert.equal(first.rows[0]?.requests, 1);
+    assert.equal(first.coverage.failedFiles, 0);
+    assert.equal(first.coverage.skippedRecords, 0);
+    assert.equal(first.coverage.prefixFiles, 1);
+    await assert.rejects(fs.readdir(path.join(f.cacheDir, 'usage-cache')), { code: 'ENOENT' });
+
+    const second = await collector.scan();
+    assert.equal(second.rows[0].requests, 2);
+    assert.equal(second.coverage.parsedFiles, 1);
+    assert.equal(second.coverage.prefixFiles, 0);
+    assert.equal((await collector.scan()).coverage.cachedFiles, 1);
+});
+
+for (const change of ['replaced', 'truncated', 'rewritten and extended'])
+{
+    test(`a plain rollout ${change} during the scan cannot publish a prefix`, async t =>
+    {
+        const f = await fixture(t);
+        const filename = await f.write('sessions/changing.jsonl', [meta('root'), context('turn-1'), modern('initial')]);
+        const replacement = await f.write('replacement.tmp', [meta('root'), context('turn-1'), modern('other')]);
+        mutateAfterFirstRead(t, filename, async () =>
+        {
+            if (change === 'replaced') await fs.rename(replacement, filename);
+            else if (change === 'truncated') await fs.truncate(filename, 0);
+            else await fs.writeFile(filename, (await fs.readFile(replacement, 'utf8')) + '\n'.repeat(100));
+        });
+        const report = await f.collector().scan();
+        assert.deepEqual(report.rows, []);
+        assert.equal(report.coverage.failedFiles, 1);
+        await assert.rejects(fs.readdir(path.join(f.cacheDir, 'usage-cache')), { code: 'ENOENT' });
+    });
+}
 
 test('old unchanged sources are excluded but old sessions resumed within retention are scanned', async t =>
 {
@@ -525,7 +593,7 @@ test('missing sources yield an empty report and disposal rejects later scans', a
     await assert.rejects(collector.scan(), { code: 'ERR_DAILY_USAGE_DISPOSED' });
 });
 
-test('weekly usage starts at the current reset and includes the first 100% response only once', async t =>
+test('weekly usage starts at the current reset and counts all responses including after 100%', async t =>
 {
     const f = await fixture(t);
     const start = '2026-11-12T12:00:11.038Z';
@@ -547,13 +615,15 @@ test('weekly usage starts at the current reset and includes the first 100% respo
         quota(start, reset, 0, { slot: 'secondary' }),
         fullResponse], { compressed: HasZstd });
     const report = await f.collector().scan();
-    assert.deepEqual(report.weekly, { startAt: Date.parse(start), startKind: 'reset',
-        fullAt: Date.parse(fullAt), usedPercent: 100, sampleAt: Date.parse(latest), rows: [
-            { model: 'gpt-6.1-sol', requests: 2, baseUsd: 0.08062, usd: 0.15362,
+    assert.deepEqual(report.weekly, { startAt: Date.parse('2026-11-12T12:00:00Z'), startKind: 'reset',
+        resetAt: Date.parse(resetWithJitter), endAt: Now, partial: false,
+        fullAt: Date.parse(fullAt), usedPercent: 100, sampleAt: Date.parse(latest),
+        afterFull: { requests: 1, usd: 0.00262 }, rows: [
+            { model: 'gpt-6.1-sol', requests: 3, usd: 0.15624,
                 unpricedRequests: 0, estimatedRequests: 0 },
         ] });
     assert.equal(report.rows.find(row => row.date === '2026-11-12').requests, 2);
-    assert.equal(report.rows.find(row => row.date === '2026-11-16').usd, 0.08062);
+    assert.equal(report.rows.find(row => row.date === '2026-11-16').usd, 0.15362);
     assert.equal(report.coverage.duplicateRequests, 2);
 });
 
@@ -573,10 +643,11 @@ test('a valid weekly expiry infers the start and keeps legacy and unpriced reque
     let now = Now;
     const collector = f.collector({ now: () => now });
     const expected = { startAt: Date.parse(start), startKind: 'inferred',
-        fullAt: null, usedPercent: 38.5, sampleAt: Date.parse(sampled), rows: [
-            { model: 'gpt-6.1-sol', requests: 1, baseUsd: 0.0015, usd: 0.0015,
+        resetAt: Date.parse(reset), endAt: Now, partial: false,
+        fullAt: null, usedPercent: 38.5, sampleAt: Date.parse(sampled), afterFull: { requests: 0, usd: 0 }, rows: [
+            { model: 'gpt-6.1-sol', requests: 1, usd: 0.0015,
                 unpricedRequests: 0, estimatedRequests: 1 },
-            { model: 'unpriced', requests: 1, baseUsd: 0, usd: 0, unpricedRequests: 1, estimatedRequests: 0 },
+            { model: 'unpriced', requests: 1, usd: 0, unpricedRequests: 1, estimatedRequests: 0 },
         ] };
     assert.deepEqual((await collector.scan()).weekly, expected);
     const cached = await collector.scan();
@@ -585,7 +656,7 @@ test('a valid weekly expiry infers the start and keeps legacy and unpriced reque
     now = Date.parse(future);
     const next = await collector.scan();
     assert.equal(next.coverage.parsedFiles, 1);
-    assert.deepEqual(next.weekly, { ...expected, fullAt: now, usedPercent: 100, sampleAt: now,
+    assert.deepEqual(next.weekly, { ...expected, endAt: now, fullAt: now, usedPercent: 100, sampleAt: now,
         rows: [expected.rows[0], { ...expected.rows[1], requests: 2, unpricedRequests: 2 }] });
     now = Now;
     assert.deepEqual((await collector.scan()).weekly, expected);
@@ -615,7 +686,8 @@ test('expiry jitter that would place the inferred start after usage falls back t
         quota(Stamp, '2026-11-19T12:00:04Z', 25)]);
     const report = await f.collector().scan();
     assert.deepEqual(report.weekly, { startAt: Date.parse(firstSample), startKind: 'observed', fullAt: null,
-        usedPercent: 25, sampleAt: Date.parse(Stamp), rows: [] });
+        resetAt: Date.parse('2026-11-19T12:00:03Z'), endAt: Now, partial: false,
+        usedPercent: 25, sampleAt: Date.parse(Stamp), afterFull: { requests: 0, usd: 0 }, rows: [] });
 });
 
 test('weekly inference uses the earliest expiry in the current jitter range and ignores a late zero', async t =>
@@ -629,8 +701,9 @@ test('weekly inference uses the earliest expiry in the current jitter range and 
         quota('2026-11-12T12:05:00Z', latest, 0), quota(Stamp, latest, 25)]);
     const report = await f.collector().scan();
     assert.deepEqual(report.weekly, { startAt: Date.parse('2026-11-12T12:00:00Z'), startKind: 'inferred',
+        resetAt: Date.parse(earliest), endAt: Now, partial: false, afterFull: { requests: 0, usd: 0 },
         fullAt: null, usedPercent: 25, sampleAt: Date.parse(Stamp), rows: [{ model: 'gpt-6.1-sol',
-            requests: 1, baseUsd: 0.00262, usd: 0.00262, estimatedRequests: 0, unpricedRequests: 0 }] });
+            requests: 1, usd: 0.00262, estimatedRequests: 0, unpricedRequests: 0 }] });
 });
 
 test('a first zero an hour after the predicted reset keeps earlier requests in the inferred window', async t =>
@@ -643,8 +716,9 @@ test('a first zero an hour after the predicted reset keeps earlier requests in t
         modern('paid-before-first-quota', { timestamp: '2026-11-12T12:01:00Z' }), quota(first, reset, 0)]);
     const report = await f.collector().scan();
     assert.deepEqual(report.weekly, { startAt: Date.parse(start), startKind: 'inferred',
+        resetAt: Date.parse(reset), endAt: Now, partial: false, afterFull: { requests: 0, usd: 0 },
         fullAt: null, usedPercent: 0, sampleAt: Date.parse(first), rows: [{ model: 'gpt-6.1-sol',
-            requests: 1, baseUsd: 0.00262, usd: 0.00262, estimatedRequests: 0, unpricedRequests: 0 }] });
+            requests: 1, usd: 0.00262, estimatedRequests: 0, unpricedRequests: 0 }] });
 });
 
 test('an expired latest weekly cycle never falls back to older conflicting future expiry evidence', async t =>
@@ -655,17 +729,20 @@ test('an expired latest weekly cycle never falls back to older conflicting futur
     assert.equal((await f.collector().scan()).weekly, null);
 });
 
-test('the latest observation with an earlier expiry still matches the same cycle across reset jitter', async t =>
+test('reset jitter keeps one observed cycle and uses its earliest exclusive reset', async t =>
 {
     const f = await fixture(t);
     await f.write('sessions/quota.jsonl', [quota('2026-11-16T09:00:00Z', '2026-11-16T12:00:03Z', 100),
         quota(Stamp, '2026-11-16T11:59:59Z', 100)]);
     const report = await f.collector().scan();
-    assert.equal(report.weekly.sampleAt, Date.parse(Stamp));
-    assert.equal(report.weekly.fullAt, Date.parse('2026-11-16T09:00:00Z'));
+    assert.equal(report.weekly, null);
+    assert.equal(report.weeklyHistory.length, 1);
+    assert.equal(report.weeklyHistory[0].resetAt, Date.parse('2026-11-16T11:59:59Z'));
+    assert.equal(report.weeklyHistory[0].sampleAt, Date.parse(Stamp));
+    assert.equal(report.weeklyHistory[0].fullAt, Date.parse('2026-11-16T09:00:00Z'));
 });
 
-test('only weekly Standard charges published cache writes and marks estimated or missing amounts', async t =>
+test('calendar and weekly Standard agree on cache write charges and estimated or missing amounts', async t =>
 {
     const f = await fixture(t);
     await f.write('sessions/cache-write.jsonl', [meta('root'), context('turn-1'),
@@ -675,14 +752,14 @@ test('only weekly Standard charges published cache writes and marks estimated or
         quota(Stamp, '2026-11-19T12:00:00Z', 25)]);
     const report = await f.collector().scan();
     assert.deepEqual(report.weekly.rows, [
-        { model: 'gpt-5.5', requests: 1, baseUsd: 0.0071, usd: 0.0066, unpricedRequests: 1, estimatedRequests: 0 },
-        { model: 'gpt-6.1-sol', requests: 2, baseUsd: 0.4, usd: 0.75, unpricedRequests: 0, estimatedRequests: 1 },
+        { model: 'gpt-5.5', requests: 1, usd: 0.0066, unpricedRequests: 1, estimatedRequests: 0 },
+        { model: 'gpt-6.1-sol', requests: 2, usd: 0.75, unpricedRequests: 0, estimatedRequests: 1 },
     ]);
     assert.deepEqual(report.rows.map(row => [row.model, row.usd, row.unpricedRequests, row.estimatedRequests]),
-        [['gpt-5.5', 0.0071, 0, 0], ['gpt-6.1-sol', 0.4, 0, 0]]);
+        [['gpt-5.5', 0.0066, 1, 0], ['gpt-6.1-sol', 0.75, 0, 1]]);
 });
 
-test('weekly history counts up to the first full response and hands the reset instant to the next cycle', async t =>
+test('weekly history counts through the exclusive reset and keeps an after-full subtotal', async t =>
 {
     const f = await fixture(t);
     const start = '2026-11-05T12:00:00Z';
@@ -709,16 +786,18 @@ test('weekly history counts up to the first full response and hands the reset in
         startAt, endAt, fullAt, sampleAt, usedPercent, models: rows.map(row => [row.model, row.requests]),
     })), [
         { startAt: Date.parse(start), endAt: Date.parse(reset) - 1, fullAt: Date.parse(fullAt),
-            sampleAt: Date.parse(last), usedPercent: 100, models: [['full', 1], ['history', 1]] },
+            sampleAt: Date.parse(last), usedPercent: 100, models: [['after-full', 1], ['full', 1], ['history', 1]] },
         { startAt: Date.parse('2026-10-29T12:00:00Z'), endAt: Date.parse(start) - 1, fullAt: null,
             sampleAt: Date.parse('2026-11-02T12:00:00Z'), usedPercent: 30, models: [['before-reset', 1]] },
     ]);
     assert.equal(report.weekly.fullAt, Date.parse(currentFull));
-    assert.deepEqual(report.weekly.rows.map(row => [row.model, row.requests]), [['current', 1]]);
+    assert.deepEqual(report.weekly.rows.map(row => [row.model, row.requests]), [['after-full', 1], ['current', 1]]);
+    assert.deepEqual(report.weekly.afterFull, { requests: 1, usd: 0 });
+    assert.deepEqual(report.weeklyHistory[0].afterFull, { requests: 1, usd: 0 });
     assert.equal(report.coverage.duplicateRequests, 1);
 });
 
-test('weekly history leaves an unobserved cycle empty and marks its oldest truncated cycle partial', async t =>
+test('weekly history keeps distinct observed cycles and marks its oldest truncated cycle partial', async t =>
 {
     const f = await fixture(t);
     const now = Date.parse('2026-11-19T12:00:00Z');
@@ -731,19 +810,19 @@ test('weekly history leaves an unobserved cycle empty and marks its oldest trunc
         modern('at-retention', { timestamp: '2026-10-20T16:00:00Z', model: 'retained' }),
         modern('unobserved-cycle', { timestamp: '2026-11-04T10:00:00Z', model: 'gap' })]);
     const report = await collector.scan();
-    assert.deepEqual(report.weeklyHistory.map(period => period && [period.startAt, period.endAt, period.partial]), [
+    assert.deepEqual(report.weeklyHistory.map(period => [period.startAt, period.endAt, period.partial]), [
         [Date.parse('2026-11-06T12:00:00Z'), Date.parse('2026-11-13T12:00:00Z') - 1, false],
-        null,
         [Date.parse('2026-10-23T12:00:00Z'), Date.parse('2026-10-30T12:00:00Z') - 1, false],
     ]);
-    assert.deepEqual(report.weeklyHistory[2].rows, []);
+    assert.deepEqual(report.weeklyHistory[1].rows, []);
+    assert.deepEqual(report.weeklyRemainder.unassigned, { requests: 2, usd: 0 });
     await f.write('sessions/active.jsonl', [
         quota('2026-11-19T11:00:00Z', '2026-11-20T12:00:00Z', 65),
         quota('2026-11-12T10:00:00Z', '2026-11-13T12:00:00Z', 75),
         quota('2026-10-26T10:00:00Z', '2026-10-27T12:00:00Z', 50),
         modern('before-retention', { timestamp: '2026-10-20T15:59:59.999Z', model: 'before-retention' }),
         modern('at-retention', { timestamp: '2026-10-20T16:00:00Z', model: 'retained' })]);
-    const partial = (await collector.scan()).weeklyHistory[2];
+    const partial = (await collector.scan()).weeklyHistory[1];
     assert.equal(partial.startAt, Date.parse('2026-10-20T12:00:00Z'));
     assert.equal(partial.partial, true);
     assert.deepEqual(partial.rows.map(row => [row.model, row.requests]), [['retained', 1]]);
@@ -763,7 +842,7 @@ test('a stale cycle stays in history when no current quota has been observed', a
     ]);
 });
 
-test('overlapping quota evidence is excluded or bounded by the last confirmed historical sample', async t =>
+test('standalone quota readings preserve all overlapping resets without assigning nearby responses', async t =>
 {
     const f = await fixture(t);
     const oldSample = '2026-11-11T09:00:00Z';
@@ -776,11 +855,15 @@ test('overlapping quota evidence is excluded or bounded by the last confirmed hi
         modern('current', { timestamp: Stamp, model: 'current' })]);
     const report = await f.collector().scan();
     assert.deepEqual(report.weekly.rows.map(row => row.model), ['current']);
-    assert.deepEqual(report.weeklyHistory.map(period => [period.endAt, period.partial,
-        period.rows.map(row => row.model)]), [[Date.parse(oldSample), true, ['confirmed']]]);
+    assert.deepEqual(report.weeklyHistory.map(period => [period.endAt, period.partial, period.rows]), [
+        [Date.parse('2026-11-15T12:00:00Z') - 1, true, []],
+        [Date.parse('2026-11-14T12:00:00Z') - 1, true, []],
+        [Date.parse('2026-11-13T12:00:00Z') - 1, true, []],
+    ]);
+    assert.deepEqual(report.weeklyRemainder.unassigned, { requests: 2, usd: 0 });
 });
 
-test('an overlapping inferred history start bills from its first independently observed sample', async t =>
+test('overlapping historical windows retain their bounds and count requests with unique timestamps', async t =>
 {
     const f = await fixture(t);
     const newerStart = '2026-11-06T10:00:00Z';
@@ -792,15 +875,16 @@ test('an overlapping inferred history start bills from its first independently o
         modern('older-sample', { timestamp: olderSample, model: 'older' }),
         modern('overlap', { timestamp: '2026-11-05T15:00:00Z', model: 'overlap' }),
         modern('newer-full', { timestamp: newerFull, model: 'newer' })]);
-    const { weeklyHistory } = await f.collector().scan();
+    const { weeklyHistory, weeklyRemainder } = await f.collector().scan();
     assert.deepEqual(weeklyHistory.map(period => [period.startAt, period.endAt, period.fullAt, period.partial,
         period.rows.map(row => row.model)]), [
-        [Date.parse(newerStart), Date.parse('2026-11-12T12:00:00Z') - 1, Date.parse(newerFull), true, ['newer']],
-        [Date.parse('2026-10-30T12:00:00Z'), Date.parse(olderSample), null, true, ['older']],
+        [Date.parse('2026-11-05T12:00:00Z'), Date.parse('2026-11-12T12:00:00Z') - 1, Date.parse(newerFull), true, ['newer']],
+        [Date.parse('2026-10-30T12:00:00Z'), Date.parse('2026-11-06T12:00:00Z') - 1, null, true, ['older']],
     ]);
+    assert.deepEqual(weeklyRemainder.unassigned, { requests: 1, usd: 0 });
 });
 
-test('an overlapping inferred current start omits the ambiguous prefix and preserves the full response', async t =>
+test('an overlapping inferred current start keeps its boundary and leaves ambiguous usage in the remainder', async t =>
 {
     const f = await fixture(t);
     const currentSample = '2026-11-16T12:00:00Z';
@@ -810,16 +894,17 @@ test('an overlapping inferred current start omits the ambiguous prefix and prese
         modern('old', { timestamp: olderSample, model: 'old' }),
         modern('ambiguous', { timestamp: '2026-11-13T12:00:00Z', model: 'ambiguous' }),
         modern('full', { timestamp: currentSample, model: 'full' })]);
-    const { weekly, weeklyHistory } = await f.collector().scan();
-    assert.equal(weekly.startAt, Date.parse(currentSample));
-    assert.equal(weekly.startKind, 'observed');
+    const { weekly, weeklyHistory, weeklyRemainder } = await f.collector().scan();
+    assert.equal(weekly.startAt, Date.parse('2026-11-12T12:00:00Z'));
+    assert.equal(weekly.startKind, 'inferred');
     assert.equal(weekly.fullAt, Date.parse(currentSample));
     assert.deepEqual(weekly.rows.map(row => row.model), ['full']);
     assert.deepEqual(weeklyHistory.map(period => [period.endAt, period.partial, period.rows.map(row => row.model)]),
-        [[Date.parse(olderSample), true, ['old']]]);
+        [[Date.parse('2026-11-15T12:00:00Z') - 1, true, ['old']]]);
+    assert.deepEqual(weeklyRemainder.unassigned, { requests: 1, usd: 0 });
 });
 
-test('an overlapping disputed reset supported by an older adjacent reset preserves a missing history slot', async t =>
+test('an observed overlapping reset keeps a history slot even if its usage is unassigned', async t =>
 {
     const f = await fixture(t);
     const currentSample = '2026-11-16T12:00:00Z';
@@ -830,10 +915,11 @@ test('an overlapping disputed reset supported by an older adjacent reset preserv
         modern('old', { timestamp: olderSample, model: 'old' }),
         modern('disputed', { timestamp: disputedSample, model: 'disputed' }),
         modern('current', { timestamp: currentSample, model: 'current' })]);
-    const { weekly, weeklyHistory } = await f.collector().scan();
+    const { weekly, weeklyHistory, weeklyRemainder } = await f.collector().scan();
     assert.deepEqual(weekly.rows.map(row => row.model), ['current']);
-    assert.deepEqual(weeklyHistory.map(period => period && [period.endAt, period.rows.map(row => row.model)]),
-        [null, [Date.parse('2026-11-08T12:00:00Z') - 1, ['old']]]);
+    assert.deepEqual(weeklyHistory.map(period => [period.endAt, period.rows.map(row => row.model)]),
+        [[Date.parse('2026-11-15T12:00:00Z') - 1, []], [Date.parse('2026-11-08T12:00:00Z') - 1, ['old']]]);
+    assert.deepEqual(weeklyRemainder.unassigned, { requests: 1, usd: 0 });
 });
 
 test('a quota sample at the exact reset does not erase the prior cycle and its known first full response', async t =>
@@ -906,4 +992,212 @@ test('overlapping reset jitter retains an ordinary reading recorded before eithe
     const cached = await collector.scan();
     assert.equal(cached.coverage.cachedFiles, 2);
     assert.deepEqual(cached.weeklyHistory, weeklyHistory);
+});
+
+test('overlap is assigned by originating response evidence and preserves a full-cycle partition', async t =>
+{
+    const f = await fixture(t);
+    const oldReset = '2026-11-14T12:00:00Z';
+    const newReset = '2026-11-19T12:00:00Z';
+    const oldFull = '2026-11-11T17:59:59Z';
+    const first = '2026-11-12T18:00:00Z';
+    const second = '2026-11-12T18:01:00Z';
+    const third = '2026-11-12T18:02:00Z';
+    function counters(input, output)
+    {
+        return { input_tokens: input, cached_input_tokens: 0, output_tokens: output };
+    }
+    function paired(id, stamp, seconds, reset, input, total, legacyTotal, options = {})
+    {
+        const timestamp = new Date(Date.parse(stamp) + seconds * 1000).toISOString();
+        const observation = legacy(legacyTotal, legacyTotal / 10, { timestamp, last: [input, input / 10] });
+        observation.payload.rate_limits = quota(timestamp, reset, 100).payload.rate_limits;
+        return [modern(id, { model: 'gpt-6.1-sol', timestamp: stamp, input, cached: 0, output: input / 10,
+            thread_token_usage: counters(total, total / 10), ...options }), observation];
+    }
+    const oldPair = paired('first-offset', first, 1, oldReset, 1000, 10000, 9000);
+    const retry = structuredClone(oldPair[1]);
+    retry.timestamp = '2026-11-12T18:00:02Z';
+    retry.payload.rate_limits.primary.resets_at++;
+    await f.write('sessions/origin.jsonl', [meta('root'), context('turn-1'), quota(oldFull, oldReset, 100),
+        ...oldPair, retry, ...paired('second-offset', second, 1, oldReset, 2000, 12000, 11000),
+        ...paired('exact-other-cycle', third, 1, newReset, 3000, 15000, 15000),
+        ...paired('uncorroborated', '2026-11-12T18:03:00Z', 1, oldReset, 4000, 19000, 10000),
+        quota('2026-11-16T11:00:00Z', newReset, 100),
+        modern('current-after-full', { timestamp: '2026-11-16T11:30:00Z' }),
+        modern('future', { timestamp: '2026-11-16T12:00:01Z' })]);
+    await f.write('archived_sessions/fork.jsonl', [meta('fork'), context('turn-1'),
+        ...paired('uncorroborated', '2026-11-12T18:03:00Z', 2, newReset, 4000, 19000, 19000)]);
+    const collector = f.collector();
+    const { rows, weekly, weeklyHistory, weeklyRemainder } = await collector.scan();
+    assert.deepEqual(weeklyHistory.map(period => [period.resetAt, period.endAt, period.fullAt, period.rows,
+        period.afterFull]), [[Date.parse(oldReset), Date.parse(oldReset) - 1, Date.parse(oldFull),
+        [{ model: 'gpt-6.1-sol', requests: 2, usd: 0.009, estimatedRequests: 0, unpricedRequests: 0 }],
+        { requests: 2, usd: 0.009 }]]);
+    assert.deepEqual(weekly.rows, [
+        { model: 'gpt-6.1-sol', requests: 2, usd: 0.01162, estimatedRequests: 0, unpricedRequests: 0 },
+    ]);
+    assert.deepEqual(weekly.afterFull, { requests: 1, usd: 0.00262 });
+    assert.deepEqual(weeklyRemainder, { earlier: { requests: 0, usd: 0 }, unassigned: { requests: 1, usd: 0.012 } });
+    assert.deepEqual(rows.map(row => [row.requests, row.usd]), [[1, 0.00262], [4, 0.03]]);
+    assert.equal((await collector.scan()).coverage.cachedFiles, 2);
+});
+
+test('older observed windows and uncovered dates remain visible in the weekly remainder', async t =>
+{
+    const f = await fixture(t);
+    await f.write('sessions/windows.jsonl', [meta('root'), context('turn-1'),
+        quota('2026-10-18T10:00:00Z', '2026-10-21T12:00:00Z', 20),
+        quota('2026-10-27T10:00:00Z', '2026-10-28T12:00:00Z', 40),
+        quota('2026-11-04T10:00:00Z', '2026-11-05T12:00:00Z', 45),
+        quota('2026-11-08T10:00:00Z', '2026-11-10T12:00:00Z', 60),
+        quota(Stamp, '2026-11-17T12:00:00Z', 70),
+        modern('earlier', { timestamp: '2026-10-20T10:00:00Z' }),
+        modern('gap', { timestamp: '2026-10-29T10:00:00Z' })]);
+    const { weeklyHistory, weeklyRemainder } = await f.collector().scan();
+    assert.deepEqual(weeklyHistory.map(period => new Date(period.resetAt).toISOString()),
+        ['2026-11-10T12:00:00.000Z', '2026-11-05T12:00:00.000Z', '2026-10-28T12:00:00.000Z']);
+    assert.deepEqual(weeklyRemainder, { earlier: { requests: 1, usd: 0.00262 }, unassigned: { requests: 1, usd: 0.00262 } });
+});
+
+test('an earlier copy uses one canonical timestamp for both Beijing dates and reset windows', async t =>
+{
+    const f = await fixture(t);
+    const reset = '2026-11-12T16:00:00Z';
+    const nextReset = '2026-11-19T16:00:00Z';
+    await f.write('sessions/copy.jsonl', [meta('fork'), context('turn-1'),
+        modern('copied', { timestamp: '2026-11-12T16:00:00Z' }), quota(Stamp, nextReset, 20),
+        modern('current', { timestamp: '2026-11-16T12:00:01Z', model: 'future-copy' })]);
+    await f.write('archived_sessions/original.jsonl', [meta('root'), context('turn-1'),
+        modern('copied', { timestamp: '2026-11-12T15:59:59.999Z' }),
+        quota('2026-11-12T15:59:59.999Z', reset, 80), modern('current')]);
+    const { rows, weekly, weeklyHistory } = await f.collector().scan();
+    assert.deepEqual(rows.map(row => [row.date, row.requests, row.usd]), [
+        ['2026-11-16', 1, 0.00262], ['2026-11-12', 1, 0.00262],
+    ]);
+    assert.equal(weekly.rows[0].requests, 1);
+    assert.equal(weeklyHistory[0].rows[0].requests, 1);
+});
+
+test('an offset cannot borrow corroboration from a response with different exact evidence', async t =>
+{
+    const f = await fixture(t);
+    const oldReset = '2026-11-14T12:00:00Z';
+    const newReset = '2026-11-19T12:00:00Z';
+    function observation(total, timestamp, reset)
+    {
+        const event = legacy(total, total / 10, { timestamp, last: [1000, 100] });
+        event.payload.rate_limits = quota(timestamp, reset, 43).payload.rate_limits;
+        return event;
+    }
+    function response(id, timestamp, total)
+    {
+        return modern(id, { timestamp, cached: 0,
+            thread_token_usage: { input_tokens: total, output_tokens: total / 10 } });
+    }
+    await f.write('sessions/origin.jsonl', [meta('root'), context('turn-1'),
+        response('exact', '2026-11-13T10:00:00Z', 1000),
+        observation(1000, '2026-11-13T10:00:01Z', newReset),
+        observation(5000, '2026-11-13T10:00:02Z', oldReset),
+        response('no-exact', '2026-11-13T10:00:03Z', 2000),
+        observation(6000, '2026-11-13T10:00:04Z', oldReset), quota(Stamp, newReset, 61)]);
+    const { weekly, weeklyHistory, weeklyRemainder } = await f.collector().scan();
+    assert.equal(weekly.rows[0].requests, 1);
+    assert.deepEqual(weeklyHistory[0].rows, []);
+    assert.deepEqual(weeklyRemainder.unassigned, { requests: 1, usd: 0.003 });
+});
+
+test('a positive unmatched snapshot vetoes time-only attribution in a single window', async t =>
+{
+    const f = await fixture(t);
+    const reset = '2026-11-19T12:00:00Z';
+    const snapshotAt = '2026-11-16T09:00:00.030Z';
+    const snapshot = legacy(5000, 500, { timestamp: snapshotAt, last: [0, 0] });
+    snapshot.payload.rate_limits = quota(snapshotAt, reset, 30).payload.rate_limits;
+    await f.write('sessions/origin.jsonl', [meta('root'), context('turn-1'),
+        modern('contradicted', { timestamp: '2026-11-16T09:00:00Z', cached: 0,
+            thread_token_usage: { input_tokens: 6000, output_tokens: 600 } }), snapshot,
+        modern('no-usage-observation'), quota('2026-11-16T10:00:01Z', reset, 35)]);
+    const collector = f.collector();
+    const report = await collector.scan();
+    assert.deepEqual(report.weekly.rows, [
+        { model: 'gpt-6.1-sol', requests: 1, usd: 0.00262, estimatedRequests: 0, unpricedRequests: 0 },
+    ]);
+    assert.deepEqual(report.weeklyRemainder.unassigned, { requests: 1, usd: 0.003 });
+    assert.equal(report.weekly.partial, true);
+    assert.deepEqual((await collector.scan()).weeklyRemainder, report.weeklyRemainder);
+});
+
+test('the most recently sampled open reset is current and the other open reset remains visible', async t =>
+{
+    const f = await fixture(t);
+    const currentReset = '2026-11-19T12:00:00Z';
+    const alternateReset = '2026-11-20T12:00:00Z';
+    const observedAt = '2026-11-16T10:00:01Z';
+    const paired = legacy(1000, 100, { timestamp: observedAt, last: [1000, 100] });
+    paired.payload.rate_limits = quota(observedAt, alternateReset, 20).payload.rate_limits;
+    await f.write('sessions/switched.jsonl', [meta('root'), context('turn-1'),
+        quota('2026-11-11T10:00:00Z', '2026-11-12T12:00:00Z', 15),
+        modern('alternate', { cached: 0, thread_token_usage: { input_tokens: 1000, output_tokens: 100 } }),
+        paired, quota('2026-11-16T11:00:00Z', currentReset, 25)]);
+    const { weekly, weeklyHistory, weeklyRemainder } = await f.collector().scan();
+    assert.equal(weekly.resetAt, Date.parse(currentReset));
+    assert.deepEqual(weeklyHistory.map(period => [period.resetAt, period.endAt, period.rows.length]), [
+        [Date.parse(alternateReset), Now, 1],
+        [Date.parse('2026-11-12T12:00:00Z'), Date.parse('2026-11-12T12:00:00Z') - 1, 0],
+    ]);
+    assert.equal(weeklyHistory[0].rows[0].usd, 0.003);
+    assert.deepEqual(weeklyRemainder.unassigned, { requests: 0, usd: 0 });
+});
+
+test('the previous reset anchors the next week when the first zero is observed thirty seconds later', async t =>
+{
+    const f = await fixture(t);
+    const start = '2026-11-12T12:00:00Z';
+    const reset = '2026-11-19T12:00:00Z';
+    await f.write('sessions/reset.jsonl', [meta('root'), context('turn-1'),
+        quota('2026-11-12T11:20:00Z', start, 100),
+        modern('first-at-reset', { timestamp: start }),
+        modern('before-first-zero', { timestamp: '2026-11-12T12:00:29.999Z' }),
+        quota('2026-11-12T12:00:30Z', reset, 0), quota(Stamp, reset, 30)]);
+    const { weekly, weeklyHistory, weeklyRemainder } = await f.collector().scan();
+    assert.equal(weekly.startAt, Date.parse(start));
+    assert.equal(weekly.startKind, 'reset');
+    assert.equal(weekly.rows[0].requests, 2);
+    assert.equal(weeklyHistory[0].endAt, Date.parse(start) - 1);
+    assert.deepEqual(weeklyRemainder.unassigned, { requests: 0, usd: 0 });
+});
+
+test('different sources with resets thirty seconds apart and conflicting percentages keep both cycles', async t =>
+{
+    const f = await fixture(t);
+    const firstReset = '2026-11-19T12:00:00Z';
+    const secondReset = '2026-11-19T12:00:30Z';
+    await f.write('sessions/first.jsonl', [meta('first'), quota(Stamp, firstReset, 100)]);
+    await f.write('sessions/second.jsonl', [meta('second'), quota('2026-11-16T10:01:00Z', secondReset, 8)]);
+    const { weekly, weeklyHistory } = await f.collector().scan();
+    assert.deepEqual([weekly, ...weeklyHistory].map(period => [period.resetAt, period.usedPercent, period.fullAt]), [
+        [Date.parse(secondReset), 8, null], [Date.parse(firstReset), 100, Date.parse(Stamp)],
+    ]);
+});
+
+test('a conflicting replay keeps the earliest calendar date and leaves its weekly usage unassigned', async t =>
+{
+    const f = await fixture(t);
+    const reset = '2026-11-12T16:00:00Z';
+    const nextReset = '2026-11-19T16:00:00Z';
+    const observed = '2026-11-12T15:59:59.030Z';
+    const originalSnapshot = legacy(1700, 100, { timestamp: observed, last: [1700, 100] });
+    originalSnapshot.payload.rate_limits = quota(observed, reset, 75).payload.rate_limits;
+    await f.write('sessions/replay.jsonl', [meta('fork'), context('turn-1'),
+        modern('conflict', { timestamp: reset }), quota(Stamp, nextReset, 20)]);
+    await f.write('archived_sessions/original.jsonl', [meta('root'), context('turn-1'),
+        modern('conflict', { timestamp: '2026-11-12T15:59:59Z', input: 1700, cached: 0,
+            thread_token_usage: { input_tokens: 1700, output_tokens: 100 } }), originalSnapshot]);
+    const report = await f.collector().scan();
+    assert.deepEqual(report.rows.map(row => [row.date, row.requests, row.usd]), [['2026-11-12', 1, 0.00262]]);
+    assert.deepEqual(report.weekly.rows, []);
+    assert.deepEqual(report.weeklyHistory[0].rows, []);
+    assert.deepEqual(report.weeklyRemainder.unassigned, { requests: 1, usd: 0.00262 });
+    assert.equal(report.coverage.conflictingRequests, 1);
 });

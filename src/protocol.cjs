@@ -77,21 +77,83 @@ function validWeeklyHistory(snapshot) {
     return true;
 }
 
+const FullCycleKeys = ["startAt", "resetAt", "endAt", "startKind", "fullAt", "sampleAt", "usedPercent",
+    "partial", "afterFull", "rows"];
+const StandardRowKeys = ["model", "requests", "usd", "estimatedRequests", "unpricedRequests"];
+
+function validSubtotal(value) {
+    return exactKeys(value, ["requests", "usd"]) && integer(value.requests) && amount(value.usd)
+        && (value.requests > 0 || value.usd === 0);
+}
+
+// Provider charges are represented at sub-cent precision. Round only for display;
+// allow the small floating-point difference from adding the same requests in another order.
+function sameUsd(left, right) {
+    return Math.abs(left - right) <= 1e-8 + 32 * Number.EPSILON * Math.max(left, right);
+}
+
+function validFullCycles(report) {
+    if (!Array.isArray(report.weeklyHistory) || report.weeklyHistory.length > MaxPreviousWeeks
+        || !exactKeys(report.weeklyRemainder, ["earlier", "unassigned"])) return false;
+    const { earlier, unassigned } = report.weeklyRemainder;
+    if (!validSubtotal(earlier) || !validSubtotal(unassigned)) return false;
+    let requests = earlier.requests + unassigned.requests;
+    let usd = earlier.usd + unassigned.usd;
+    const resets = new Set();
+    for (const week of [report.weekly, ...report.weeklyHistory]) {
+        if (week === null) continue;
+        if (!exactKeys(week, FullCycleKeys) || !["reset", "inferred", "observed"].includes(week.startKind)
+            || !integer(week.startAt) || !integer(week.resetAt) || week.resetAt <= week.startAt
+            || week.endAt !== Math.min(report.generatedAt, week.resetAt - 1) || week.endAt < week.startAt
+            || resets.has(week.resetAt) || typeof week.partial !== "boolean"
+            || !Array.isArray(week.rows) || week.rows.length > 10000 || !validSubtotal(week.afterFull)) return false;
+        resets.add(week.resetAt);
+        if (week.sampleAt === null) {
+            if (week.usedPercent !== null || week.fullAt !== null) return false;
+        } else if (!integer(week.sampleAt) || week.sampleAt < week.startAt || week.sampleAt > week.endAt
+            || !Number.isFinite(week.usedPercent) || week.usedPercent < 0 || week.usedPercent > 100) return false;
+        if (week.fullAt === null) {
+            if (week.afterFull.requests !== 0 || week.usedPercent === 100) return false;
+        } else if (!integer(week.fullAt) || week.fullAt < week.startAt || week.fullAt > week.sampleAt) return false;
+
+        const models = new Set();
+        let weekRequests = 0, weekUsd = 0;
+        for (const row of week.rows) {
+            if (!exactKeys(row, StandardRowKeys) || !concise(row.model, 128)
+                || !/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(row.model) || models.has(row.model)
+                || !integer(row.requests) || !row.requests || !amount(row.usd)
+                || !integer(row.estimatedRequests) || row.estimatedRequests > row.requests
+                || !integer(row.unpricedRequests) || row.unpricedRequests > row.requests) return false;
+            models.add(row.model);
+            weekRequests += row.requests;
+            weekUsd += row.usd;
+        }
+        if (week.afterFull.requests > weekRequests ||
+            (week.afterFull.usd > weekUsd && !sameUsd(week.afterFull.usd, weekUsd))) return false;
+        requests += weekRequests;
+        usd += weekUsd;
+    }
+    const dailyRequests = report.rows.reduce((n, row) => n + row.requests, 0);
+    const dailyUsd = report.rows.reduce((n, row) => n + row.usd, 0);
+    return integer(requests) && requests === dailyRequests && sameUsd(usd, dailyUsd);
+}
+
 function validateSnapshot(value, options = {}) {
     const invalid = reason => ({ ok: false, reason });
     if (!record(options)) return invalid("invalid");
     const { now = Date.now() } = options;
     const version = value?.schemaVersion;
-    const keys = version === 3 ? [...RootKeys, "weekly", "weeklyHistory"]
+    const keys = version === 4 ? [...RootKeys, "weekly", "weeklyHistory", "weeklyRemainder"]
+        : version === 3 ? [...RootKeys, "weekly", "weeklyHistory"]
         : version === 2 ? [...RootKeys, "weekly"] : RootKeys;
-    if (!integer(now) || ![1, 2, 3].includes(version) || !exactKeys(value, keys)
+    if (!integer(now) || ![1, 2, 3, 4].includes(version) || !exactKeys(value, keys)
         || value.source !== "com.kpk.daily-usage" || !normalizeThreadId(value.machineId)
         || !normalizeThreadId(value.publisherId) || !integer(value.revision) || value.revision === 0
         || !integer(value.generatedAt) || value.timezone !== "Asia/Shanghai"
         || !validDate(value.from) || !validDate(value.to) || value.from > value.to
         || !Array.isArray(value.rows) || value.rows.length > 10000) return invalid("invalid");
     if (value.generatedAt - now > FutureSkewMs) return invalid("future");
-    if (version >= 2 && !validWeekly(value.weekly, value.generatedAt)) return invalid("invalid");
+    if ((version === 2 || version === 3) && !validWeekly(value.weekly, value.generatedAt)) return invalid("invalid");
     if (version === 3 && !validWeeklyHistory(value)) return invalid("invalid");
     const identities = new Set();
     for (const row of value.rows) {
@@ -104,6 +166,7 @@ function validateSnapshot(value, options = {}) {
         if (identities.has(key)) return invalid("invalid");
         identities.add(key);
     }
+    if (version === 4 && !validFullCycles(value)) return invalid("invalid");
     const coverage = value.coverage;
     if (!record(coverage) || CoverageCounts.some(key => !integer(coverage[key]))
         || !Array.isArray(coverage.warnings) || coverage.warnings.length > 100
@@ -113,7 +176,7 @@ function validateSnapshot(value, options = {}) {
     if (!exactKeys(value.pricing, ["basis", "asOf", "source"])
         || !concise(value.pricing.source, 512)) return invalid("invalid");
     const { basis, asOf } = value.pricing;
-    const currentPricing = basis === Pricing.basis && asOf === Pricing.asOf;
+    const currentPricing = asOf === Pricing.asOf && basis === (version === 4 ? "codex-standard-estimate" : "codex-base-estimate");
     const priorPricing = asOf === "2026-11-16"
         && ["codex-base-estimate", "standard-base-api", "standard"].includes(basis);
     if (!currentPricing && !priorPricing) return invalid("invalid");
@@ -121,10 +184,12 @@ function validateSnapshot(value, options = {}) {
         if (Buffer.byteLength(JSON.stringify(value), "utf8") > MaxSnapshotBytes) return invalid("size");
     } catch { return invalid("invalid"); }
     if (!currentPricing) return invalid("update-required");
+    if (version < (options.minVersion ?? 1)) return invalid("update-required");
     return { ok: true };
 }
 
 function snapshotForPeer(snapshot, requestedVersion = 1) {
+    if (snapshot.schemaVersion === 4) return requestedVersion === 4 ? snapshot : null;
     const version = requestedVersion === 3 || requestedVersion === 2 ? requestedVersion : 1;
     if (snapshot.schemaVersion <= version) return snapshot;
     const { weekly, weeklyHistory, ...daily } = snapshot;
@@ -136,7 +201,7 @@ function snapshotWithinLimit(snapshot, options) {
     for (;;) {
         const checked = validateSnapshot(snapshot, options);
         if (checked.ok) return snapshot;
-        if (checked.reason !== "size" || snapshot.schemaVersion === 1) return null;
+        if (checked.reason !== "size" || snapshot.schemaVersion === 1 || snapshot.schemaVersion === 4) return null;
         snapshot = snapshotForPeer(snapshot, snapshot.schemaVersion - 1);
     }
 }

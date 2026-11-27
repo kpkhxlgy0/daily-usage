@@ -16,52 +16,38 @@ test('cached input is charged separately and reasoning output is not added twice
     assert.equal(price.uncachedInputTokens, 800);
     assert.equal(price.usd, 0.00262);
     assert.equal(price.unpriced, false);
-    assert.equal(Pricing.basis, 'codex-base-estimate');
+    assert.equal(Pricing.basis, 'codex-standard-estimate');
     assert.equal(Pricing.asOf, '2026-11-18');
 });
 
-test('crossing 272000 input tokens keeps the same base input, cache and output rates', () =>
+test('Standard long-context rates apply to every request above 272000 input tokens', () =>
 {
     assert.equal(priceRequest(request({ inputTokens: 272000, cachedInputTokens: 72000,
         outputTokens: 1000 })).usd, 0.4172);
     assert.equal(priceRequest(request({ inputTokens: 272001, cachedInputTokens: 72000,
-        outputTokens: 1000 })).usd, 0.417202);
+        outputTokens: 1000 })).usd, 0.829404);
     assert.equal(priceRequest(request({ model: 'gpt-6-astra', inputTokens: 300000,
-        cachedInputTokens: 280000, outputTokens: 1000 })).usd, 0.53);
+        cachedInputTokens: 280000, outputTokens: 1000 })).usd, 1.035);
     assert.equal(priceRequest(request({ model: 'gpt-6-astra', inputTokens: 1000000,
-        cachedInputTokens: 900000, outputTokens: 1000 })).usd, 1.95);
+        cachedInputTokens: 900000, outputTokens: 1000 })).usd, 3.875);
 });
 
-test('weekly Standard pricing applies long-context rates only above 272000 input tokens', () =>
+test('long-context Standard pricing applies the cache write premium with the input multiplier', () =>
 {
-    const options = { standard: true };
-    assert.equal(priceRequest(request({ inputTokens: 272000, cachedInputTokens: 72000,
-        outputTokens: 1000 }), options).usd, 0.4172);
-    assert.equal(priceRequest(request({ inputTokens: 272001, cachedInputTokens: 72000,
-        outputTokens: 1000 }), options).usd, 0.829404);
     assert.equal(priceRequest(request({ model: 'gpt-6-astra', inputTokens: 300000,
-        cachedInputTokens: 280000, cacheWriteTokens: 10000, cacheWriteTtl: '12h', outputTokens: 1000 }), options).usd,
+        cachedInputTokens: 280000, cacheWriteTokens: 10000, cacheWriteTtl: '12h', outputTokens: 1000 })).usd,
     1.335);
-    assert.equal(priceRequest(request({ model: 'unpriced', inputTokens: 300000 }), options).unpriced, true);
 });
 
-test('weekly Standard quotes the published write retention by model and preserves known subtotals', () =>
+test('Standard prices cache writes using retention and marks its fallback rate estimated', () =>
 {
-    const options = { standard: true };
     const pureWrite = request({ inputTokens: 100000, cachedInputTokens: 0, cacheWriteTokens: 100000,
         cacheWriteTtl: '12h', outputTokens: 0 });
-    assert.equal(priceRequest(pureWrite).usd, 0.2);
-    assert.equal(priceRequest(pureWrite, options).usd, 0.5);
-    assert.equal(priceRequest({ ...pureWrite, cacheWriteTtl: '30m' }, options).usd, 0.25);
-    const fallback = priceRequest({ ...pureWrite, cacheWriteTtl: null }, options);
+    assert.equal(priceRequest(pureWrite).usd, 0.5);
+    assert.equal(priceRequest({ ...pureWrite, cacheWriteTtl: '30m' }).usd, 0.25);
+    const fallback = priceRequest({ ...pureWrite, cacheWriteTtl: null });
     assert.equal(fallback.usd, 0.25);
     assert.equal(fallback.estimated, true);
-    for (const [model, want] of [['gpt-5.5', 0.0066], ['gpt-5.4', 0.0033]])
-    {
-        const partial = priceRequest(request({ model, cacheWriteTokens: 100, cacheWriteTtl: '12h' }), options);
-        assert.equal(partial.usd, want);
-        assert.equal(partial.unpriced, true);
-    }
 });
 
 test('all verified Standard models use their own input, cached and output prices', () =>
@@ -76,38 +62,23 @@ test('all verified Standard models use their own input, cached and output prices
     for (const [model, want] of cases) assert.equal(priceRequest(request({ model })).usd, want, model);
 });
 
-test('cache writes use ordinary input rates once regardless of TTL and retain distinct counters', () =>
+test('Standard calculates uncached, cached and write input separately', () =>
 {
-    for (const cacheWriteTtl of ['30m', '12h', undefined])
-    {
-        const price = priceRequest(request({ cacheWriteTokens: 100, cacheWriteTtl }));
-        assert.equal(price.usd, 0.00262, cacheWriteTtl);
-        assert.equal(price.uncachedInputTokens, 700);
-        assert.equal(price.unpriced, false);
-        assert.deepEqual(price.reasons, []);
-    }
+    const price = priceRequest(request({ cacheWriteTokens: 100, cacheWriteTtl: '12h' }));
+    assert.equal(price.usd, 0.00292);
+    assert.equal(price.uncachedInputTokens, 700);
+    assert.equal(price.unpriced, false);
+    assert.deepEqual(price.reasons, []);
 });
 
-test('large cache writes keep ordinary base input rates without long-context or TTL premiums', () =>
+test('models without write rates preserve known subtotals and unknown models remain unpriced', () =>
 {
-    for (const cacheWriteTtl of ['30m', '12h', undefined])
-    {
-        const price = priceRequest(request({ inputTokens: 300000, cachedInputTokens: 0,
-            cacheWriteTokens: 100000, cacheWriteTtl, outputTokens: 1000 }));
-        assert.equal(price.usd, 0.61);
-        assert.equal(price.uncachedInputTokens, 200000);
-        assert.equal(price.unpriced, false);
-    }
-});
-
-test('known older models price cache writes as ordinary input while unknown models remain unpriced', () =>
-{
-    for (const [model, want] of [['gpt-5.5', 0.0071], ['gpt-5.4', 0.00355]])
+    for (const [model, want] of [['gpt-5.5', 0.0066], ['gpt-5.4', 0.0033]])
     {
         const price = priceRequest(request({ model, cacheWriteTokens: 100 }));
         assert.equal(price.usd, want, model);
         assert.equal(price.uncachedInputTokens, 700);
-        assert.equal(price.unpriced, false);
+        assert.equal(price.unpriced, true);
     }
     const unknown = priceRequest(request({ model: 'custom-private-model', cacheWriteTokens: 100 }));
     assert.equal(unknown.usd, 0);
@@ -125,12 +96,12 @@ test('invalid overlapping or noninteger token counts never yield a negative or i
         assert.equal(price.usd, 0);
     }
 });
-test('conflicting retention fields keep weekly cache-write pricing visibly estimated', () => {
+test('conflicting retention fields keep cache-write pricing visibly estimated', () => {
     const { normalizeUsage } = require('../src/log-parser.cjs');
     const usage = normalizeUsage({ input_tokens: 100000, output_tokens: 0, cache_write_input_tokens: 100000,
         cache_write_ttl: '30m', cache_write_ttl_seconds: 43200 });
     assert.equal(usage.cacheWriteTtl, null);
-    const price = priceRequest({ ...usage, model: 'gpt-6.1-sol' }, { standard: true });
+    const price = priceRequest({ ...usage, model: 'gpt-6.1-sol' });
     assert.equal(price.usd, 0.25);
     assert.equal(price.estimated, true);
 });

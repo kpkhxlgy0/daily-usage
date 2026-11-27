@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { createRolloutReader } = require('./vendor/rollout-reader.cjs');
+const { scanPlainRollout } = require('./plain-rollout-reader.cjs');
 const { createLogParser } = require('./log-parser.cjs');
 const { priceRequest, Pricing, validTokens } = require('./pricing.cjs');
 const { validWeeklyData, weeklyWindows } = require('./weekly-quota.cjs');
@@ -11,8 +12,7 @@ const { validWeeklyData, weeklyWindows } = require('./weekly-quota.cjs');
 const DayMs = 24 * 60 * 60 * 1000;
 const BeijingOffsetMs = 8 * 60 * 60 * 1000;
 const RetentionDays = 30;
-const CacheVersion = 3;
-const OffsetPairWindowMs = 5 * 60 * 1000;
+const CacheVersion = 4;
 
 function beijingDate(timestamp)
 {
@@ -58,16 +58,18 @@ function validCachedData(value)
     function event(entry)
     {
         return entry && Number.isFinite(entry.timestamp) && Math.abs(entry.timestamp) < 8.64e15 - BeijingOffsetMs
-            && typeof entry.model === 'string' && entry.model.length <= 128;
+            && typeof entry.model === 'string' && entry.model.length <= 128
+            && Array.isArray(entry.weeklyResets) && entry.weeklyResets.every(resetAt =>
+                Number.isSafeInteger(resetAt) && resetAt > 0 && resetAt < 8.64e15 && resetAt % 1000 === 0);
     }
     return value && typeof value.sourceId === 'string' && validTokens(value.skippedRecords)
         && validTokens(value.oversizedRecords) && Array.isArray(value.modernThreads)
         && value.modernThreads.every(thread => typeof thread === 'string')
         && Array.isArray(value.modern) && value.modern.every(entry => event(entry) && usage(entry)
-            && typeof entry.id === 'string' && typeof entry.thread === 'string'
+            && typeof entry.id === 'string' && typeof entry.thread === 'string' && typeof entry.weeklyConflict === 'boolean'
             && (entry.threadUsageKey === null || typeof entry.threadUsageKey === 'string'))
         && Array.isArray(value.legacy) && value.legacy.every(entry => event(entry) && usage(entry.total)
-            && (entry.last === null || usage(entry.last)));
+            && (entry.last === null || usage(entry.last)) && typeof entry.paired === 'boolean');
 }
 
 function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {})
@@ -175,12 +177,19 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
             return cached.data;
         }
         const parser = createLogParser({ sourceId: 'file-' + key, minTimestamp: cutoff, maxWeeklyTimestamp: generatedAt });
-        const result = await reader.scan(source.filename, { onChunk: parser.onChunk });
+        const result = /\.zst$/i.test(source.filename)
+            ? await reader.scan(source.filename, { onChunk: parser.onChunk })
+            : await scanPlainRollout(source.filename, parser.onChunk, checkActive);
         checkActive();
-        const data = parser.finish();
+        const data = parser.finish({ discardTail: result.prefix });
+        coverage.parsedFiles++;
+        if (result.prefix)
+        {
+            coverage.prefixFiles++;
+            return data;
+        }
         cached = { schemaVersion: CacheVersion, version: fingerprint(result.stat), cutoff, data };
         memory.set(key, cached);
-        coverage.parsedFiles++;
         let temporary;
         try
         {
@@ -212,7 +221,7 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
         const cutoff = Date.parse(to + 'T00:00:00+08:00') - (RetentionDays - 1) * DayMs;
         const from = beijingDate(cutoff);
         const coverage = { files: 0, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [],
-            parsedFiles: 0, cachedFiles: 0, duplicateRequests: 0, conflictingRequests: 0,
+            parsedFiles: 0, prefixFiles: 0, cachedFiles: 0, duplicateRequests: 0, conflictingRequests: 0,
             discoveryErrors: 0, cacheErrors: 0, oversizedRecords: 0, legacySkippedRecords: 0,
             redundantLegacyRecords: 0 };
         progress('discovering', coverage);
@@ -239,42 +248,59 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
             progress('scanning', coverage, ++processedFiles);
         }
         checkActive();
-        const { current, history } = weeklyWindows(data, generatedAt, cutoff);
-        function trackWeekly(window, endAt)
+        const { current, history, older, windows, byReset } = weeklyWindows(data, generatedAt, cutoff);
+        const weeklyUsage = new Map();
+        function summary()
         {
-            return window && { window, endAt: window.fullAt ?? endAt, rows: new Map() };
+            return { requests: 0, usd: 0 };
         }
-        const currentUsage = trackWeekly(current, generatedAt);
-        const historicalUsage = history.map(period => trackWeekly(period, period?.endAt));
-        const weeklyUsage = [currentUsage, ...historicalUsage].filter(Boolean);
-        const earlierCopies = new Map();
-        function includeWeekly(event, timestamp, estimated = false)
+        for (const window of [current, ...history])
         {
-            if (timestamp < cutoff) return;
-            const period = weeklyUsage.find(({ window, endAt }) => timestamp >= window.startAt && timestamp <= endAt);
-            if (!period) return;
-            const weeklyRows = period.rows;
-            let row = weeklyRows.get(event.model);
+            if (window) weeklyUsage.set(window, { rows: new Map(), afterFull: summary() });
+        }
+        const weeklyRemainder = { earlier: summary(), unassigned: summary() };
+        function addRequest(row, price, estimated = false)
+        {
+            row.requests++;
+            row.usd += price.usd;
+            if ('unpricedRequests' in row && price.unpriced) row.unpricedRequests++;
+            if ('estimatedRequests' in row && estimated) row.estimatedRequests++;
+        }
+        function includeWeekly(event, price, estimated)
+        {
+            const candidates = windows.filter(window => event.timestamp >= window.startAt && event.timestamp <= window.endAt);
+            const evidence = new Set(event.weeklyResets.map(reset => byReset.get(reset)).filter(Boolean));
+            const matched = evidence.size === 1 ? [...evidence][0] : null;
+            const window = event.usageConflict ? null : matched && candidates.includes(matched) ? matched
+                : !evidence.size && !event.weeklyConflict && candidates.length === 1 ? candidates[0] : null;
+            const period = weeklyUsage.get(window);
+            if (!period)
+            {
+                const remainder = older.has(window) ? weeklyRemainder.earlier : weeklyRemainder.unassigned;
+                addRequest(remainder, price);
+                if (!window)
+                {
+                    for (const candidate of candidates) candidate.partial = true;
+                }
+                return;
+            }
+            let row = period.rows.get(event.model);
             if (!row)
             {
-                row = { model: event.model, requests: 0, baseUsd: 0, usd: 0,
-                    unpricedRequests: 0, estimatedRequests: 0 };
-                weeklyRows.set(event.model, row);
+                row = { model: event.model, requests: 0, usd: 0, estimatedRequests: 0, unpricedRequests: 0 };
+                period.rows.set(event.model, row);
             }
-            const standard = priceRequest(event, { standard: true });
-            row.requests++;
-            row.baseUsd += priceRequest(event).usd;
-            row.usd += standard.usd;
-            if (standard.unpriced) row.unpricedRequests++;
-            if (estimated || standard.estimated) row.estimatedRequests++;
+            addRequest(row, price, estimated);
+            if (window.fullAt !== null && event.timestamp > window.fullAt) addRequest(period.afterFull, price);
         }
         const rows = new Map();
         let unpricedRequests = 0;
-        function include(event, estimated = false)
+        function include(event, legacy = false)
         {
+            if (event.timestamp < cutoff || event.timestamp > generatedAt) return;
             const date = beijingDate(event.timestamp);
-            if (date < from || date > to) return;
             const price = priceRequest(event);
+            const estimated = legacy || price.estimated;
             const key = date + ':' + event.model;
             let row = rows.get(key);
             if (!row)
@@ -284,35 +310,24 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
                     unpricedRequests: 0, estimatedRequests: 0 };
                 rows.set(key, row);
             }
-            row.requests++;
+            addRequest(row, price, estimated);
             for (const field of ['inputTokens', 'cachedInputTokens', 'cacheWriteTokens', 'outputTokens'])
             {
                 row[field] += event[field];
             }
             row.uncachedInputTokens += price.uncachedInputTokens;
-            row.usd += price.usd;
-            if (price.unpriced)
-            {
-                row.unpricedRequests++;
-                unpricedRequests++;
-            }
-            if (estimated)
-            {
-                row.estimatedRequests++;
-                coverage.legacyRequests++;
-            }
+            if (price.unpriced) unpricedRequests++;
+            if (legacy) coverage.legacyRequests++;
+            includeWeekly(event, price, estimated);
         }
         const modernThreads = new Set(data.flatMap(source => source.modernThreads));
         const modernTotals = new Map();
-        const modernTimeline = new Map();
         const responses = new Map();
         for (const source of data)
         {
             for (const event of source.modern)
             {
-                const timeline = modernTimeline.get(event.thread) || [];
-                timeline.push(event);
-                modernTimeline.set(event.thread, timeline);
+                if (event.timestamp > generatedAt) continue;
                 if (event.threadUsageKey)
                 {
                     const totals = modernTotals.get(event.thread) || new Set();
@@ -321,64 +336,24 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
                 }
                 if (responses.has(event.id))
                 {
-                    coverage.duplicateRequests++;
                     const previous = responses.get(event.id);
-                    if (weeklyUsage.length && event.timestamp < (earlierCopies.get(event.id) ?? previous.timestamp))
+                    if (event.timestamp >= cutoff) coverage.duplicateRequests++;
+                    // 分叉副本不能把已经发生的请求带入较新的自然日或周窗口。
+                    previous.timestamp = Math.min(previous.timestamp, event.timestamp);
+                    if (usageKey(previous) !== usageKey(event) || previous.model !== event.model
+                        || previous.cacheWriteTokens > 0 && previous.cacheWriteTtl !== event.cacheWriteTtl)
                     {
-                        // 分叉副本的时间不得把已经发生的请求带入较新的周窗口。
-                        earlierCopies.set(event.id, event.timestamp);
+                        previous.usageConflict = true;
+                        if (event.timestamp >= cutoff) coverage.conflictingRequests++;
+                        continue;
                     }
-                    if (usageKey(previous) !== usageKey(event) || previous.model !== event.model)
-                    {
-                        coverage.conflictingRequests++;
-                    }
-                    continue;
+                    previous.weeklyResets.push(...event.weeklyResets);
+                    previous.weeklyConflict ||= event.weeklyConflict;
                 }
-                responses.set(event.id, event);
-                include(event);
+                else responses.set(event.id, { ...event, weeklyResets: [...event.weeklyResets] });
             }
         }
-        if (weeklyUsage.length)
-        {
-            for (const event of responses.values()) includeWeekly(event, earlierCopies.get(event.id) ?? event.timestamp);
-        }
-        for (const timeline of modernTimeline.values()) timeline.sort((a, b) => a.timestamp - b.timestamp);
-        const offsetPairs = new Map();
-        for (const source of data)
-        {
-            const timeline = modernTimeline.get(source.sourceId)
-                || (source.modernThreads.length === 1 ? modernTimeline.get(source.modernThreads[0]) : null);
-            if (!timeline) continue;
-            const counters = new Set(source.legacy.filter(event => event.timestamp >= cutoff)
-                .map(event => usageKey(event.total)));
-            for (const modern of timeline)
-            {
-                if (counters.has(modern.threadUsageKey))
-                {
-                    offsetPairs.set(modern.thread + ':' + modern.id, modern.threadUsageKey);
-                }
-            }
-        }
-        function pairedOffset(event, timeline)
-        {
-            if (!event.last || !timeline) return false;
-            let low = 0;
-            let high = timeline.length;
-            while (low < high)
-            {
-                const middle = Math.floor((low + high) / 2);
-                if (timeline[middle].timestamp <= event.timestamp) low = middle + 1;
-                else high = middle;
-            }
-            const modern = timeline[low - 1];
-            if (!modern || event.timestamp - modern.timestamp > OffsetPairWindowMs
-                || usageKey(modern) !== usageKey(event.last)) return false;
-            const response = modern.thread + ':' + modern.id;
-            const counter = usageKey(event.total);
-            if (offsetPairs.has(response)) return offsetPairs.get(response) === counter;
-            offsetPairs.set(response, counter);
-            return true;
-        }
+        for (const event of responses.values()) include(event);
         const legacyThreads = new Map();
         for (const source of data)
         {
@@ -389,13 +364,10 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
                 {
                     for (const key of modernTotals.get(thread) || []) totals.add(key);
                 }
-                const timeline = modernTimeline.get(source.sourceId)
-                    || (source.modernThreads.length === 1 ? modernTimeline.get(source.modernThreads[0]) : null);
                 for (const event of source.legacy)
                 {
-                    if (event.timestamp < cutoff) continue;
-                    // 历史偏移只能用相邻请求佐证；同一响应不可覆盖多个不同累计值。
-                    if (totals.has(usageKey(event.total)) || pairedOffset(event, timeline))
+                    if (event.timestamp < cutoff || event.timestamp > generatedAt) continue;
+                    if (event.paired || totals.has(usageKey(event.total)))
                     {
                         coverage.redundantLegacyRecords++;
                     }
@@ -420,6 +392,7 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
             let previous;
             for (const event of events)
             {
+                if (event.timestamp > generatedAt) break;
                 let usage;
                 if (!previous)
                 {
@@ -444,7 +417,8 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
                 }
                 if (!usage || event.timestamp < cutoff || !usage.inputTokens && !usage.outputTokens) continue;
                 const key = digest([event.timestamp, event.model, usageKey(event.total)].join('|'));
-                const candidate = { timestamp: event.timestamp, model: event.model, ...usage };
+                const weeklyResets = event.last && usageKey(event.last) === usageKey(usage) ? event.weeklyResets : [];
+                const candidate = { timestamp: event.timestamp, model: event.model, ...usage, weeklyResets };
                 const existing = legacyCandidates.get(key);
                 if (existing)
                 {
@@ -452,6 +426,7 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
                     // 分叉可能只复制累计流的尾部；保留已观察到的完整增量，禁止再叠加 last。
                     if (usage.inputTokens >= existing.inputTokens && usage.outputTokens >= existing.outputTokens)
                     {
+                        if (usageKey(usage) === usageKey(existing)) candidate.weeklyResets = [...existing.weeklyResets, ...weeklyResets];
                         legacyCandidates.set(key, candidate);
                     }
                     continue;
@@ -459,16 +434,13 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
                 legacyCandidates.set(key, candidate);
             }
         }
-        for (const event of legacyCandidates.values())
-        {
-            include(event, true);
-            includeWeekly(event, event.timestamp, true);
-        }
+        for (const event of legacyCandidates.values()) include(event, true);
         if (coverage.failedFiles) coverage.warnings.push(`有 ${coverage.failedFiles} 个用量文件读取失败。`);
+        if (coverage.prefixFiles) coverage.warnings.push(`有 ${coverage.prefixFiles} 个用量文件在扫描期间继续写入，已统计读取时完整的记录。`);
         if (coverage.discoveryErrors) coverage.warnings.push(`有 ${coverage.discoveryErrors} 处历史目录无法读取。`);
         if (coverage.skippedRecords) coverage.warnings.push(`跳过 ${coverage.skippedRecords} 条不完整记录，统计覆盖不全。`);
         if (coverage.oversizedRecords) coverage.warnings.push(`${coverage.oversizedRecords} 条记录超过 1 MiB 上限。`);
-        if (coverage.conflictingRequests) coverage.warnings.push('重复响应的用量或模型不一致，已保留首条。');
+        if (coverage.conflictingRequests) coverage.warnings.push('重复响应的用量、缓存期限或模型不一致，金额采用首条记录。');
         if (coverage.legacySkippedRecords) coverage.warnings.push('旧版累计记录缺少对应逐请求记录，已保守排除。');
         if (coverage.legacyRequests) coverage.warnings.push(`${coverage.legacyRequests} 条旧版累计增量为估算，请求数、日期和金额可能不完整。`);
         if (legacyBaselineGaps) coverage.warnings.push('旧版累计前缀缺少单次用量，仅用作基线。');
@@ -477,20 +449,19 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
         if (coverage.cacheErrors) coverage.warnings.push('用量缓存写入失败，仍显示已读取的统计。');
         const result = [...rows.values()].sort((a, b) => b.date.localeCompare(a.date) || a.model.localeCompare(b.model));
         for (const row of result) row.usd = Number(row.usd.toFixed(12));
-        function weeklyReport(period)
+        function weeklyReport(window)
         {
-            if (!period) return null;
+            if (!window) return null;
+            const period = weeklyUsage.get(window);
             const rows = [...period.rows.values()].sort((a, b) => a.model.localeCompare(b.model));
-            for (const row of rows)
-            {
-                row.baseUsd = Number(row.baseUsd.toFixed(12));
-                row.usd = Number(row.usd.toFixed(12));
-            }
-            return { ...period.window, rows };
+            for (const row of rows) row.usd = Number(row.usd.toFixed(12));
+            period.afterFull.usd = Number(period.afterFull.usd.toFixed(12));
+            return { ...window, afterFull: period.afterFull, rows };
         }
+        for (const row of Object.values(weeklyRemainder)) row.usd = Number(row.usd.toFixed(12));
         progress('complete', coverage, processedFiles);
-        return { generatedAt, timezone: 'Asia/Shanghai', from, to, rows: result, weekly: weeklyReport(currentUsage),
-            weeklyHistory: historicalUsage.map(weeklyReport), coverage, pricing: { ...Pricing } };
+        return { generatedAt, timezone: 'Asia/Shanghai', from, to, rows: result, weekly: weeklyReport(current),
+            weeklyHistory: history.map(weeklyReport), weeklyRemainder, coverage, pricing: { ...Pricing } };
     }
 
     return {

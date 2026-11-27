@@ -10,12 +10,13 @@ const Id = "11111111-1111-4111-8111-111111111111";
 const Publisher = "33333333-3333-4333-8333-333333333333";
 const Now = 1794787200000;
 const base = { schemaVersion: 1, source: "com.kpk.daily-usage", demandVersion: 1 };
-const marker = { ...base, requestId: Id, action: "query", sequence: 1, requestedAt: Now, expiresAt: Now + 300000 };
-const snapshot = { schemaVersion: 1, source: "com.kpk.daily-usage",
+const marker = { ...base, requestId: Id, action: "query", sequence: 1, requestedAt: Now, expiresAt: Now + 300000, snapshotVersion: 4 };
+const snapshot = { schemaVersion: 4, source: "com.kpk.daily-usage",
     machineId: "22222222-2222-4222-8222-222222222222", publisherId: Publisher, revision: 1,
     generatedAt: Now, timezone: "Asia/Shanghai", from: "2026-10-18", to: "2026-11-16", rows: [],
     coverage: { files: 0, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-    pricing: { ...Pricing } };
+    weekly: null, weeklyHistory: [], weeklyRemainder: { earlier: { requests: 0, usd: 0 },
+        unassigned: { requests: 0, usd: 0 } }, pricing: { ...Pricing } };
 
 test("markers use a bounded lifetime and cancellation preserves the query identity and timestamps", () => {
     assert.deepEqual(makeMarker(Id, Now), marker);
@@ -24,14 +25,13 @@ test("markers use a bounded lifetime and cancellation preserves the query identi
         directory: "/home/me/.codex/.daily-usage", requests: "/home/me/.codex/.daily-usage/requests",
         responses: "/home/me/.codex/.daily-usage/responses",
         capabilities: "/home/me/.codex/.daily-usage/capabilities.json",
-        capabilitiesV2: "/home/me/.codex/.daily-usage/capabilities-v2.json",
-        capabilitiesV3: "/home/me/.codex/.daily-usage/capabilities-v3.json" });
+        capabilitiesV4: "/home/me/.codex/.daily-usage/capabilities-v4.json" });
     assert.equal(demandPaths("C:\\Codex", path.win32).requests, "C:\\Codex\\.daily-usage\\requests");
     assert.equal(validateMarker(marker, { now: Now }).ok, true);
     const weekly = { ...marker, snapshotVersion: 2 };
     assert.equal(validateMarker(weekly, { now: Now }).ok, true);
     assert.equal(validateMarker({ ...weekly, snapshotVersion: 3 }, { now: Now }).ok, true);
-    assert.equal(validateMarker({ ...weekly, snapshotVersion: 4 }, { now: Now }).ok, false);
+    assert.equal(validateMarker({ ...weekly, snapshotVersion: 5 }, { now: Now }).ok, false);
     assert.equal(makeMarker(Id, Now, "cancel", weekly).snapshotVersion, 2);
     assert.equal(validateMarker({ ...marker, action: "cancel", sequence: 2 }, { now: Now }).ok, true);
     assert.equal(MaxDemandBytes, 2048);
@@ -72,8 +72,18 @@ test("capabilities and results bind to one endpoint and validate snapshots befor
 
 for (const basis of ["standard", "standard-base-api", "codex-base-estimate"])
 test(`successful demand responses propagate the ${basis} pricing update requirement`, () => {
+    const { weekly, weeklyHistory, weeklyRemainder, ...daily } = snapshot;
     const value = { ...base, requestId: Id, publisherId: Publisher, updatedAt: Now, status: "ok",
-        snapshot: { ...snapshot, pricing: { ...snapshot.pricing, basis, asOf: "2026-11-16" } } };
+        snapshot: { ...daily, schemaVersion: 1, pricing: { ...snapshot.pricing, basis, asOf: "2026-11-16" } } };
     assert.deepEqual(validateResult(value, { requestId: Id, publisherId: Publisher, now: Now }),
         { ok: false, reason: "update-required" });
+});
+
+test("whole-cycle marker uses the v4 capability and keeps its version on cancellation", () => {
+    const latest = makeMarker(Id, Now);
+    assert.equal(latest.snapshotVersion, 4);
+    assert.equal(validateMarker(latest, { now: Now }).ok, true);
+    assert.equal(makeMarker(Id, Now, "cancel", latest).snapshotVersion, 4);
+    assert.equal(demandPaths("/home/me/.codex", path.posix).capabilitiesV4,
+        "/home/me/.codex/.daily-usage/capabilities-v4.json");
 });

@@ -14,10 +14,11 @@ const { createService } = require('../src/service.cjs');
 
 function report()
 {
-    return { schemaVersion: 1, source: 'com.kpk.daily-usage', machineId: randomUUID(), publisherId: randomUUID(),
+    return { schemaVersion: 4, source: 'com.kpk.daily-usage', machineId: randomUUID(), publisherId: randomUUID(),
         revision: 1, generatedAt: Date.now(), timezone: 'Asia/Shanghai', from: '2026-10-18', to: '2026-11-17',
         rows: [], coverage: { files: 0, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { ...Pricing } };
+        weekly: null, weeklyHistory: [], weeklyRemainder: { earlier: { requests: 0, usd: 0 },
+            unassigned: { requests: 0, usd: 0 } }, pricing: { ...Pricing } };
 }
 
 async function setup(t, options = {})
@@ -84,43 +85,42 @@ async function waitFor(read, predicate = Boolean)
 // Close the observer's handle before the publisher can replace a response on Windows.
 const response = (paths, id) => JSON.parse(nativeFs.readFileSync(path.join(paths.responses, `${id}.json`), 'utf8'));
 
-test('a blocked optional weekly advertisement leaves daily queries usable', async t =>
+test('old peers receive terminal upgrade errors and v4 peers receive unprojected week history', async t =>
 {
-    const { paths, calls } = await setup(t, { beforeStart: p => fs.mkdir(p.capabilitiesV2) });
-    assert.equal(validateCapabilities(JSON.parse(await fs.readFile(paths.capabilities, 'utf8'))).ok, true);
+    const { paths, calls } = await setup(t);
+    const caps = JSON.parse(await fs.readFile(paths.capabilities, 'utf8'));
+    assert.equal(validateCapabilities(caps).ok, true);
+    assert.deepEqual(JSON.parse(await fs.readFile(paths.capabilitiesV4, 'utf8')), caps);
+    for (const version of [undefined, 2, 3])
+    {
+        const marker = makeMarker(randomUUID(), Date.now());
+        if (version === undefined) delete marker.snapshotVersion;
+        else marker.snapshotVersion = version;
+        await write(paths, marker);
+        const result = await waitFor(() => response(paths, marker.requestId), value => value.status === 'error');
+        assert.equal(result.error, 'snapshot-update-required');
+        assert.equal(Object.hasOwn(result, 'snapshot'), false);
+    }
+    assert.equal(calls.length, 0);
+    const local = report();
+    const now = local.generatedAt;
+    local.rows.push({ date: local.to, model: 'gpt-6.1-sol', requests: 2, inputTokens: 100,
+        uncachedInputTokens: 100, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 10,
+        usd: 0.8, unpricedRequests: 0, estimatedRequests: 0 });
+    local.weekly = { startAt: now - 1000, resetAt: now + 5000, endAt: now, startKind: 'observed',
+        fullAt: now - 500, sampleAt: now - 100, usedPercent: 100, partial: false,
+        afterFull: { requests: 1, usd: 0.3 }, rows: [{ model: 'gpt-6.1-sol', requests: 2, usd: 0.8,
+            unpricedRequests: 0, estimatedRequests: 0 }] };
+    local.weeklyHistory = [{ startAt: now - 9000, resetAt: now - 3000, endAt: now - 3001, startKind: 'inferred',
+        fullAt: null, sampleAt: null, usedPercent: null, partial: false,
+        afterFull: { requests: 0, usd: 0 }, rows: [] }];
     const marker = makeMarker(randomUUID(), Date.now());
     await write(paths, marker);
     await waitFor(() => Promise.resolve(calls.length), count => count === 1);
-    calls[0].resolve({ status: 'ok', snapshot: { ...report(), schemaVersion: 2, weekly: null } });
-    const result = await waitFor(() => response(paths, marker.requestId), value => value.status === 'ok');
-    assert.equal(result.snapshot.schemaVersion, 1);
-    assert.equal((await fs.lstat(paths.capabilitiesV2)).isDirectory(), true);
-});
-
-test('new runners return a weekly snapshot only when the requester supports it', async t =>
-{
-    const { paths, calls } = await setup(t);
-    const legacyCaps = JSON.parse(await fs.readFile(paths.capabilities, 'utf8'));
-    assert.deepEqual(JSON.parse(await fs.readFile(paths.capabilitiesV2, 'utf8')), legacyCaps);
-    assert.deepEqual(JSON.parse(await fs.readFile(paths.capabilitiesV3, 'utf8')), legacyCaps);
-    const now = Date.now();
-    const weekly = { startAt: now - 1000, startKind: 'observed', fullAt: null,
-        sampleAt: now, usedPercent: 42, rows: [] };
-    const previous = { ...weekly, startAt: now - 5000, sampleAt: now - 2500, endAt: now - 2000, partial: true };
-    const local = { ...report(), generatedAt: now, schemaVersion: 3, weekly, weeklyHistory: [previous] };
-    for (const snapshotVersion of [1, 2, 3])
-    {
-        const marker = makeMarker(randomUUID(), Date.now());
-        if (snapshotVersion > 1) marker.snapshotVersion = snapshotVersion;
-        await write(paths, marker);
-        await waitFor(() => Promise.resolve(calls.length), count => count === snapshotVersion);
-        calls.at(-1).resolve({ status: 'ok', snapshot: local });
-        const result = await waitFor(() => response(paths, marker.requestId), value => value.status === 'ok');
-        assert.equal(result.snapshot.schemaVersion, snapshotVersion);
-        assert.deepEqual(result.snapshot.weekly, snapshotVersion >= 2 ? weekly : undefined);
-        assert.deepEqual(result.snapshot.weeklyHistory, snapshotVersion === 3 ? [previous] : undefined);
-    }
-    assert.deepEqual(local.weekly, weekly);
+    calls[0].resolve({ status: 'ok', snapshot: local });
+    const result = await waitFor(() => response(paths, marker.requestId), value => value.status !== 'running');
+    assert.equal(result.status, 'ok', JSON.stringify(result));
+    assert.deepEqual(result.snapshot, { ...local, publisherId: caps.publisherId });
 });
 
 test('native watcher advertises ready then runs exactly one query per fresh marker and leaves idle unchanged', async t =>
@@ -151,6 +151,7 @@ test('native watcher advertises ready then runs exactly one query per fresh mark
     await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(calls.length, 1);
     await assert.rejects(fs.access(paths.capabilities), { code: 'ENOENT' });
+    await assert.rejects(fs.access(paths.capabilitiesV4), { code: 'ENOENT' });
 });
 
 test('cancel markers abort immediately, reject late success and tombstone delayed queries', async t =>
@@ -538,6 +539,7 @@ test('native request/response watcher roundtrip uses a real lazy collector with 
     await write(paths, marker);
     await notification;
     const result = await waitFor(() => response(paths, marker.requestId), value => value.status === 'ok');
+    assert.equal(result.snapshot.schemaVersion, 4);
     assert.equal(result.snapshot.rows.length, 0);
     assert.equal(result.snapshot.coverage.files, 0);
     const summary = path.join(paths.directory, 'summary.json');

@@ -20,18 +20,23 @@ const rollout = id => `${Home}/sessions/2026/11/16/rollout-2026-11-16T00-00-00-$
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
 function sample(overrides = {}) {
-    return { schemaVersion: 1, source: "com.kpk.daily-usage", machineId: "22222222-2222-4222-8222-222222222222",
+    return { schemaVersion: 4, source: "com.kpk.daily-usage", machineId: "22222222-2222-4222-8222-222222222222",
         publisherId: PublisherId, revision: 1, generatedAt: Now, timezone: "Asia/Shanghai",
         from: "2026-10-18", to: "2026-11-16", rows: [],
         coverage: { files: 2, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { ...Pricing }, ...overrides };
+        weekly: null, weeklyHistory: [], weeklyRemainder: { earlier: { requests: 0, usd: 0 },
+            unassigned: { requests: 0, usd: 0 } }, pricing: { ...Pricing }, ...overrides };
+}
+
+function legacySample(value = sample(), basis = "codex-base-estimate", asOf = Pricing.asOf) {
+    const { weeklyRemainder, ...dailyAndWeekly } = value;
+    return { ...dailyAndWeekly, schemaVersion: 3, pricing: { ...value.pricing, basis, asOf } };
 }
 
 const Requests = `${Directory}/requests`;
 const Responses = `${Directory}/responses`;
 const Capabilities = `${Directory}/capabilities.json`;
-const CapabilitiesV2 = `${Directory}/capabilities-v2.json`;
-const CapabilitiesV3 = `${Directory}/capabilities-v3.json`;
+const CapabilitiesV4 = `${Directory}/capabilities-v4.json`;
 const PriorPricingBases = ["standard", "standard-base-api", "codex-base-estimate"];
 const Base = { schemaVersion: 1, source: "com.kpk.daily-usage", demandVersion: 1 };
 
@@ -43,7 +48,7 @@ function fixture(t) {
     state.notify = () => { for (const watch of state.watches) watch.changed(); };
     state.finish = (id = state.markers.at(-1)?.requestId, overrides = {}) => {
         state.results.set(id, { ...Base, requestId: id, publisherId: state.publisherId, updatedAt: state.now,
-            status: "ok", snapshot: state.value, ...overrides });
+            status: "ok", ...(overrides.status === "error" ? {} : { snapshot: state.value }), ...overrides });
         state.notify();
     };
     state.request = async (method, params, limits) => {
@@ -52,12 +57,11 @@ function fixture(t) {
         if (method === "thread/read") return state.thread ?? { thread: { id: params.threadId, path: rollout(params.threadId) } };
         const isResult = params.path?.startsWith(`${Responses}/`);
         const isMarker = params.path?.startsWith(`${Requests}/`);
-        const capabilities = [Capabilities, CapabilitiesV2, CapabilitiesV3];
+        const capabilities = [Capabilities, CapabilitiesV4];
         assert.ok([Home, Directory, Requests, Responses, ...capabilities].includes(params.path) || isResult || isMarker,
             `Unexpected path ${params.path}`);
         if (method === "fs/getMetadata") {
-            if (state.oldPeer && params.path === Capabilities || params.path === CapabilitiesV2 && !state.weeklyPublisher
-                || params.path === CapabilitiesV3 && !state.historyPublisher
+            if (state.oldPeer && params.path === Capabilities || params.path === CapabilitiesV4 && state.missingV4
                 || isResult && !state.results.has(params.path.split("/").at(-1).slice(0, -5))) {
                 throw Object.assign(new Error("ENOENT private path"), { code: "ENOENT" });
             }
@@ -76,7 +80,7 @@ function fixture(t) {
         }
         assert.equal(method, "fs/readFile");
         if (capabilities.includes(params.path)) return { dataBase64: Buffer.from(JSON.stringify({ ...Base,
-            publisherId: [state.publisherId, state.weeklyPublisher, state.historyPublisher][capabilities.indexOf(params.path)] })).toString("base64") };
+            publisherId: params.path === CapabilitiesV4 ? state.fullCyclePublisher ?? state.publisherId : state.publisherId })).toString("base64") };
         assert.equal(isResult, true);
         const id = params.path.split("/").at(-1).slice(0, -5);
         if (!state.results.has(id)) throw Object.assign(new Error("ENOENT private path"), { code: "ENOENT" });
@@ -103,31 +107,41 @@ function fixture(t) {
     return state;
 }
 
-test("an unusable optional advertisement falls back to daily without following a symlink", async t => {
+test("an unusable v4 advertisement requires an upgrade without following a symlink", async t => {
     const f = fixture(t);
-    f.weeklyPublisher = PublisherId;
-    f.metadata = (path, info) => path === CapabilitiesV2 ? { ...info, isSymlink: true } : info;
-    assert.equal((await f.get()).status, "ok");
-    assert.equal(f.markers.at(-1).snapshotVersion, undefined);
-    assert.equal(f.calls.some(call => call.method === "fs/readFile" && call.params.path === CapabilitiesV2), false);
+    f.metadata = (path, info) => path === CapabilitiesV4 ? { ...info, isSymlink: true } : info;
+    assert.equal((await f.get()).error, "snapshot-update-required");
+    assert.equal(f.markers.length, 0);
+    assert.equal(f.watches.length, 0);
+    assert.equal(f.calls.some(call => call.method === "fs/readFile" && call.params.path === CapabilitiesV4), false);
 });
 
-test("only opts into weekly snapshots for the active remote publisher that advertises them", async t => {
+test("the viewer queries only if v4 is advertised by the active publisher", async t => {
     const f = fixture(t);
-    assert.equal((await f.get()).status, "ok");
-    assert.equal(f.markers.at(-1).snapshotVersion, undefined);
-    f.weeklyPublisher = NextPublisher;
-    assert.equal((await f.get()).status, "ok");
-    assert.equal(f.markers.at(-1).snapshotVersion, undefined);
-    f.weeklyPublisher = PublisherId;
-    f.historyPublisher = NextPublisher;
-    f.value = sample({ revision: 2, schemaVersion: 2, weekly: null });
-    assert.equal((await f.get()).snapshot.schemaVersion, 2);
-    assert.equal(f.markers.at(-1).snapshotVersion, 2);
-    f.historyPublisher = PublisherId;
-    f.value = sample({ revision: 3, schemaVersion: 3, weekly: null, weeklyHistory: [] });
+    f.missingV4 = true;
+    assert.equal((await f.get()).error, "snapshot-update-required");
+    f.missingV4 = false;
+    f.fullCyclePublisher = NextPublisher;
+    assert.equal((await f.get()).error, "snapshot-update-required");
+    assert.equal(f.markers.length, 0);
+    assert.equal(f.watches.length, 0);
+    f.fullCyclePublisher = PublisherId;
     assert.deepEqual((await f.get()).snapshot, f.value);
-    assert.equal(f.markers.at(-1).snapshotVersion, 3);
+    assert.equal(f.markers.at(-1).snapshotVersion, 4);
+});
+
+test("a terminal oversized report preserves only the last compatible cache", async t => {
+    const f = fixture(t);
+    const cached = (await f.get()).snapshot;
+    f.wait = true;
+    const task = f.get();
+    await flush();
+    f.finish(undefined, { status: "error", error: "snapshot-too-large" });
+    const result = await task;
+    assert.equal(result.error, "snapshot-too-large");
+    assert.equal(result.status, "stale");
+    assert.deepEqual(result.snapshot, cached);
+    assert.equal(f.markers.filter(marker => marker.action === "cancel").length, 0);
 });
 
 test("one remote query watches before its marker and reads only capabilities and its matching response", async t => {
@@ -140,7 +154,7 @@ test("one remote query watches before its marker and reads only capabilities and
     assert.equal(f.markers.length, 1);
     assert.deepEqual(f.calls[0].params, { threadId: ThreadId, includeTurns: false });
     assert.ok(f.calls.filter(x => x.method === "fs/readFile").every(x =>
-        x.params.path === Capabilities || x.params.path === `${Responses}/${f.markers[0].requestId}.json`));
+        [Capabilities, CapabilitiesV4].includes(x.params.path) || x.params.path === `${Responses}/${f.markers[0].requestId}.json`));
     assert.ok(f.calls.every(x => x.limits.timeoutMs > 0 && x.limits.timeoutMs <= 5000
         && x.limits.maxChars <= 3 * 1024 * 1024 && x.limits.signal instanceof AbortSignal));
     const reads = f.calls.length;
@@ -176,23 +190,26 @@ test("offline preserves the original cached report, is host isolated and never e
 for (const basis of PriorPricingBases)
 test(`${basis} November 16 pricing responses require an update and never become an accepted remote cache`, async t => {
     const f = fixture(t);
-    f.value = sample({ pricing: { ...sample().pricing, basis, asOf: "2026-11-16" } });
+    f.value = legacySample(sample(), basis, "2026-11-16");
     assert.deepEqual(await f.get(), { status: "unavailable", error: "snapshot-update-required" });
     f.offline = true;
     assert.deepEqual(await f.get(), { status: "unavailable", error: "snapshot-unavailable" });
 });
 
-for (const basis of PriorPricingBases)
-test(`${basis} November 16 pricing responses preserve only a previously accepted estimate as stale`, async t => {
+for (const basis of [...PriorPricingBases, "codex-base-estimate November 18"])
+test(`${basis} legacy pricing responses preserve only a previously accepted estimate as stale`, async t => {
     const f = fixture(t);
     f.value.rows = [{ date: "2026-11-16", model: "gpt-5.4", requests: 1, inputTokens: 300000,
         uncachedInputTokens: 100000, cachedInputTokens: 200000, cacheWriteTokens: 0, outputTokens: 10000,
         usd: 0.45, unpricedRequests: 0, estimatedRequests: 0 }];
+    f.value.weeklyRemainder.unassigned = { requests: 1, usd: 0.45 };
     const first = await f.get();
     assert.equal(first.status, "ok");
     const accepted = first.snapshot;
-    f.value = { ...accepted, revision: 2, generatedAt: Now + 1,
-        rows: [{ ...accepted.rows[0], usd: 0.825 }], pricing: { ...accepted.pricing, basis, asOf: "2026-11-16" } };
+    const latestLegacy = basis.endsWith("November 18");
+    f.value = legacySample({ ...accepted, revision: 2, generatedAt: Now + 1,
+        rows: [{ ...accepted.rows[0], usd: 0.825 }] }, latestLegacy ? "codex-base-estimate" : basis,
+    latestLegacy ? Pricing.asOf : "2026-11-16");
     const result = await f.get();
     assert.equal(result.status, "stale");
     assert.equal(result.error, "snapshot-update-required");
@@ -678,11 +695,12 @@ test("real two-end filesystem demand uses native notifications, delivers a fresh
     const watch = (directory, options) => f.transport.watch(f.frame, Host, directory, options);
     const fresh = await phase(store.get({ hostId: Host, threadId: ThreadId }, request, { watch }), "fresh report");
     assert.equal(fresh.status, "ok", JSON.stringify({ fresh, recentCalls: calls.slice(-8) }));
+    assert.equal(fresh.snapshot.schemaVersion, 4);
     assert.equal(fresh.snapshot.revision, 1);
     assert.equal(scans, 1);
     assert.equal(watches.size, 0);
     assert.equal(calls.filter(x => x.method === "fs/readFile").every(x =>
-        ["capabilities.json", "capabilities-v2.json", "capabilities-v3.json"].includes(path.basename(x.params.path))
+        ["capabilities.json", "capabilities-v4.json"].includes(path.basename(x.params.path))
         || x.params.path.includes(`${path.sep}responses${path.sep}`)), true);
     const idleCalls = calls.length;
     await new Promise(resolve => setTimeout(resolve, 40));

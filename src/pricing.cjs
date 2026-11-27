@@ -1,6 +1,6 @@
 'use strict';
 
-const Pricing = Object.freeze({ basis: 'codex-base-estimate', asOf: '2026-11-18',
+const Pricing = Object.freeze({ basis: 'codex-standard-estimate', asOf: '2026-11-18',
     source: 'https://developers.openai.com/api/docs/pricing.md' });
 const Million = 1000000;
 const LongContextInputTokens = 272000;
@@ -32,7 +32,7 @@ function validTokens(value)
 }
 
 function priceRequest({ model, inputTokens, cachedInputTokens = 0, cacheWriteTokens = 0,
-    cacheWriteTtl, outputTokens } = {}, { standard = false } = {})
+    cacheWriteTtl, outputTokens } = {})
 {
     if (![inputTokens, cachedInputTokens, cacheWriteTokens, outputTokens].every(validTokens)
         || cachedInputTokens > inputTokens || cacheWriteTokens > inputTokens - cachedInputTokens)
@@ -46,7 +46,7 @@ function priceRequest({ model, inputTokens, cachedInputTokens = 0, cacheWriteTok
     let cacheWriteMultiplier = 1;
     let estimated = false;
     const reasons = [];
-    if (standard && cacheWriteTokens > 0)
+    if (cacheWriteTokens > 0)
     {
         if (ModelsWithoutCacheWriteRates.has(model))
         {
@@ -62,7 +62,7 @@ function priceRequest({ model, inputTokens, cachedInputTokens = 0, cacheWriteTok
     const inputPrice = (uncachedInputTokens + cacheWriteTokens * cacheWriteMultiplier) * inputRate
         + cachedInputTokens * cachedRate;
     const outputPrice = outputTokens * outputRate;
-    const subtotal = standard && inputTokens > LongContextInputTokens
+    const subtotal = inputTokens > LongContextInputTokens
         ? inputPrice * LongContextInputMultiplier + outputPrice * LongContextOutputMultiplier
         : inputPrice + outputPrice;
     return { usd: Number((subtotal / Million).toFixed(12)), unpriced: reasons.length > 0,

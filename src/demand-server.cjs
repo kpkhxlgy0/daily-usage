@@ -5,9 +5,9 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { setTimeout: delay } = require('node:timers/promises');
-const { normalizeThreadId, validateSnapshot, snapshotForPeer } = require('./protocol.cjs');
+const { normalizeThreadId, validateSnapshot } = require('./protocol.cjs');
 const { demandPaths, validateMarker, validateCapabilities, validateResult,
-    MaxDemandBytes, MaxResultBytes } = require('./demand-protocol.cjs');
+    FullCycleSnapshotVersion, MaxDemandBytes, MaxResultBytes } = require('./demand-protocol.cjs');
 
 const MaxConcurrentRequests = 8;
 const MaxTrackedRequests = 1024;
@@ -230,11 +230,18 @@ function createDemandServer({ codexHome, service, now = Date.now })
             finish(entry);
             if (state?.status === 'ok')
             {
-                if (!validateSnapshot(state.snapshot, { now: now() }).ok) throw new Error('invalid-report');
-                const snapshot = { ...snapshotForPeer(state.snapshot, entry.marker.snapshotVersion), publisherId };
-                await publish(entry, 'ok', { snapshot });
+                const checked = validateSnapshot(state.snapshot, { now: now(), minVersion: FullCycleSnapshotVersion });
+                if (!checked.ok)
+                {
+                    const error = checked.reason === 'size' ? 'snapshot-too-large'
+                        : checked.reason === 'update-required' ? 'snapshot-update-required' : 'collector-failed';
+                    await publish(entry, 'error', { error });
+                    return;
+                }
+                await publish(entry, 'ok', { snapshot: { ...state.snapshot, publisherId } });
             }
-            else await publish(entry, 'error', { error: 'collector-failed' });
+            else await publish(entry, 'error', { error: ['snapshot-too-large', 'snapshot-update-required'].includes(state?.error)
+                ? state.error : 'collector-failed' });
         }
         catch
         {
@@ -259,7 +266,7 @@ function createDemandServer({ codexHome, service, now = Date.now })
         if (previous)
         {
             if (marker.requestedAt !== previous.marker.requestedAt || marker.expiresAt !== previous.marker.expiresAt
-                || marker.sequence <= previous.sequence) return;
+                || marker.snapshotVersion !== previous.marker.snapshotVersion || marker.sequence <= previous.sequence) return;
             cancel(previous);
             return;
         }
@@ -269,6 +276,11 @@ function createDemandServer({ codexHome, service, now = Date.now })
         if (marker.action === 'cancel')
         {
             cancel(entry);
+            return;
+        }
+        if (marker.snapshotVersion !== FullCycleSnapshotVersion)
+        {
+            publish(entry, 'error', { error: 'snapshot-update-required' });
             return;
         }
         if (activeCount >= MaxConcurrentRequests)
@@ -321,11 +333,7 @@ function createDemandServer({ codexHome, service, now = Date.now })
         watcher.on('error', () => { void dispose(); });
         const capabilities = { schemaVersion: 1, source: 'com.kpk.daily-usage', demandVersion: 1, publisherId };
         await atomicWrite(paths.capabilities, capabilities, () => true);
-        for (const file of [paths.capabilitiesV2, paths.capabilitiesV3])
-        {
-            try { await atomicWrite(file, capabilities, () => true); }
-            catch { /* 可选汇总版本单独协商。 */ }
-        }
+        await atomicWrite(paths.capabilitiesV4, capabilities, () => true);
     })();
 
     function dispose()
@@ -345,7 +353,7 @@ function createDemandServer({ codexHome, service, now = Date.now })
             await ready.catch(() => {});
             await Promise.all([...tasks]);
             if (!rootInfo || !requestInfo || !responseInfo) return;
-            for (const filename of [paths.capabilities, paths.capabilitiesV2, paths.capabilitiesV3])
+            for (const filename of [paths.capabilities, paths.capabilitiesV4])
             {
                 try
                 {

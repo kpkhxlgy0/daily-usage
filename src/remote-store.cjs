@@ -123,7 +123,7 @@ function createRemoteStore({ now = Date.now } = {}) {
                 }
             }));
             const before = await inspect();
-            const capabilities = async (file = paths.capabilities) => {
+            const capabilities = async file => {
                 try {
                     metadata(await rpc("fs/getMetadata", { path: file }), false, MaxDemandBytes);
                     const value = decode((await rpc("fs/readFile", { path: file }))?.dataBase64, MaxDemandBytes);
@@ -131,15 +131,19 @@ function createRemoteStore({ now = Date.now } = {}) {
                     return value;
                 } catch (error) {
                     if (signal.aborted || disposed) throw aborted();
-                    if (file !== paths.capabilities) return null;
-                    if (error.code === "ENOENT") throw failure("snapshot-update-required");
+                    if (error.code === "ENOENT" || file === paths.capabilitiesV4 && error.reason === "snapshot-invalid") {
+                        throw failure("snapshot-update-required");
+                    }
                     throw error;
                 }
             };
-            const peer = await capabilities();
-            let snapshotVersion = 1;
-            if ((await capabilities(paths.capabilitiesV3))?.publisherId === peer.publisherId) snapshotVersion = 3;
-            else if ((await capabilities(paths.capabilitiesV2))?.publisherId === peer.publisherId) snapshotVersion = 2;
+            const compatiblePeer = async () => {
+                const peer = await capabilities(paths.capabilities);
+                const advertised = await capabilities(paths.capabilitiesV4);
+                if (advertised.publisherId !== peer.publisherId) throw failure("snapshot-update-required");
+                return peer;
+            };
+            const peer = await compatiblePeer();
             try {
                 subscription = await bounded(childSignal => {
                     const pending = Promise.resolve(watch(paths.responses, { signal }));
@@ -158,7 +162,6 @@ function createRemoteStore({ now = Date.now } = {}) {
                 throw failure("snapshot-update-required");
             }
             marker = makeMarker(randomUUID(), now());
-            if (snapshotVersion > 1) marker.snapshotVersion = snapshotVersion;
             markerPath = target.pathApi.join(paths.requests, `${marker.requestId}.json`);
             const responsePath = target.pathApi.join(paths.responses, `${marker.requestId}.json`);
             markerAttempted = true;
@@ -175,14 +178,18 @@ function createRemoteStore({ now = Date.now } = {}) {
                 }
                 if (value !== undefined) {
                     const checked = validateResult(value, { requestId: marker.requestId,
-                        publisherId: peer.publisherId, now: now(), snapshotVersion });
+                        publisherId: peer.publisherId, now: now() });
                     if (!checked.ok) throw failure(`snapshot-${checked.reason}`);
                     if (value.updatedAt + FutureSkewMs < marker.requestedAt) throw failure("snapshot-replay");
-                    if (value.status === "error") throw failure("snapshot-unavailable");
+                    if (value.status === "error") {
+                        completed = true;
+                        throw failure(["snapshot-too-large", "snapshot-update-required"].includes(value.error)
+                            ? value.error : "snapshot-unavailable");
+                    }
                     if (value.status === "cancelled") throw failure("snapshot-cancelled");
                     if (value.status === "ok") {
                         const [after, native, confirmedPeer] = await Promise.all([inspect(),
-                            rpc("thread/read", { threadId, includeTurns: false }), capabilities()]);
+                            rpc("thread/read", { threadId, includeTurns: false }), compatiblePeer()]);
                         const confirmed = context(native, threadId);
                         const canonical = value => target.pathApi.sep === "\\" ? value.toLowerCase() : value;
                         if (canonical(confirmed.codexHome) !== canonical(target.codexHome)

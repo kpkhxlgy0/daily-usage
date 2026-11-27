@@ -17,7 +17,7 @@ function snapshot(overrides = {}) {
             uncachedInputTokens: 70, cachedInputTokens: 20, cacheWriteTokens: 10, outputTokens: 30,
             usd: 0.001, unpricedRequests: 1, estimatedRequests: 0 }],
         coverage: { files: 2, failedFiles: 0, skippedRecords: 0, legacyRequests: 0, warnings: [] },
-        pricing: { ...Pricing, source: "https://openai.com/api/pricing/" },
+        pricing: { ...Pricing, basis: "codex-base-estimate", source: "https://openai.com/api/pricing/" },
         ...overrides };
 }
 
