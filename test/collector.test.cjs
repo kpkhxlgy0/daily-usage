@@ -681,3 +681,229 @@ test('only weekly Standard charges published cache writes and marks estimated or
     assert.deepEqual(report.rows.map(row => [row.model, row.usd, row.unpricedRequests, row.estimatedRequests]),
         [['gpt-5.5', 0.0071, 0, 0], ['gpt-6.1-sol', 0.4, 0, 0]]);
 });
+
+test('weekly history counts up to the first full response and hands the reset instant to the next cycle', async t =>
+{
+    const f = await fixture(t);
+    const start = '2026-11-05T12:00:00Z';
+    const reset = '2026-11-12T12:00:00Z';
+    const fullAt = '2026-11-08T10:00:00Z';
+    const last = '2026-11-11T12:00:00Z';
+    const currentFull = '2026-11-14T10:00:00Z';
+    await f.write('sessions/active.jsonl', [quota(start, reset, 0),
+        modern('full', { timestamp: '2026-11-12T12:00:01Z', model: 'full' }),
+        modern('current-start', { timestamp: reset, model: 'current' }),
+        quota(reset, '2026-11-19T12:00:00Z', 0), quota(currentFull, '2026-11-19T12:00:17Z', 100),
+        modern('current-after-full', { timestamp: Stamp, model: 'after-full' }),
+        quota(Stamp, '2026-11-19T12:00:31Z', 100)]);
+    await f.write('archived_sessions/older.jsonl', [
+        quota('2026-11-02T12:00:00Z', start, 30),
+        modern('before-reset', { timestamp: '2026-11-05T11:59:59.999Z', model: 'before-reset' }),
+        modern('history-start', { timestamp: start, model: 'history' }),
+        modern('full', { timestamp: fullAt, model: 'full' }),
+        quota(fullAt, '2026-11-12T12:00:17Z', 100),
+        modern('after-full', { timestamp: '2026-11-08T10:00:00.001Z', model: 'after-full' }),
+        quota(last, reset, 100)]);
+    const report = await f.collector().scan();
+    assert.deepEqual(report.weeklyHistory.map(({ startAt, endAt, fullAt, sampleAt, usedPercent, rows }) => ({
+        startAt, endAt, fullAt, sampleAt, usedPercent, models: rows.map(row => [row.model, row.requests]),
+    })), [
+        { startAt: Date.parse(start), endAt: Date.parse(reset) - 1, fullAt: Date.parse(fullAt),
+            sampleAt: Date.parse(last), usedPercent: 100, models: [['full', 1], ['history', 1]] },
+        { startAt: Date.parse('2026-10-29T12:00:00Z'), endAt: Date.parse(start) - 1, fullAt: null,
+            sampleAt: Date.parse('2026-11-02T12:00:00Z'), usedPercent: 30, models: [['before-reset', 1]] },
+    ]);
+    assert.equal(report.weekly.fullAt, Date.parse(currentFull));
+    assert.deepEqual(report.weekly.rows.map(row => [row.model, row.requests]), [['current', 1]]);
+    assert.equal(report.coverage.duplicateRequests, 1);
+});
+
+test('weekly history leaves an unobserved cycle empty and marks its oldest truncated cycle partial', async t =>
+{
+    const f = await fixture(t);
+    const now = Date.parse('2026-11-19T12:00:00Z');
+    const collector = f.collector({ now: () => now });
+    await f.write('sessions/active.jsonl', [
+        quota('2026-11-19T11:00:00Z', '2026-11-20T12:00:00Z', 65),
+        quota('2026-11-12T10:00:00Z', '2026-11-13T12:00:00Z', 75),
+        quota('2026-10-29T10:00:00Z', '2026-10-30T12:00:00Z', 50),
+        modern('before-retention', { timestamp: '2026-10-20T15:59:59.999Z', model: 'before-retention' }),
+        modern('at-retention', { timestamp: '2026-10-20T16:00:00Z', model: 'retained' }),
+        modern('unobserved-cycle', { timestamp: '2026-11-04T10:00:00Z', model: 'gap' })]);
+    const report = await collector.scan();
+    assert.deepEqual(report.weeklyHistory.map(period => period && [period.startAt, period.endAt, period.partial]), [
+        [Date.parse('2026-11-06T12:00:00Z'), Date.parse('2026-11-13T12:00:00Z') - 1, false],
+        null,
+        [Date.parse('2026-10-23T12:00:00Z'), Date.parse('2026-10-30T12:00:00Z') - 1, false],
+    ]);
+    assert.deepEqual(report.weeklyHistory[2].rows, []);
+    await f.write('sessions/active.jsonl', [
+        quota('2026-11-19T11:00:00Z', '2026-11-20T12:00:00Z', 65),
+        quota('2026-11-12T10:00:00Z', '2026-11-13T12:00:00Z', 75),
+        quota('2026-10-26T10:00:00Z', '2026-10-27T12:00:00Z', 50),
+        modern('before-retention', { timestamp: '2026-10-20T15:59:59.999Z', model: 'before-retention' }),
+        modern('at-retention', { timestamp: '2026-10-20T16:00:00Z', model: 'retained' })]);
+    const partial = (await collector.scan()).weeklyHistory[2];
+    assert.equal(partial.startAt, Date.parse('2026-10-20T12:00:00Z'));
+    assert.equal(partial.partial, true);
+    assert.deepEqual(partial.rows.map(row => [row.model, row.requests]), [['retained', 1]]);
+});
+
+test('a stale cycle stays in history when no current quota has been observed', async t =>
+{
+    const f = await fixture(t);
+    await f.write('sessions/active.jsonl', [
+        quota('2026-11-14T12:00:00Z', '2026-11-15T12:00:00Z', 65),
+        modern('known', { timestamp: '2026-11-14T13:00:00Z', model: 'historical' }),
+        modern('unknown', { timestamp: Stamp, model: 'unobserved' })]);
+    const report = await f.collector().scan();
+    assert.equal(report.weekly, null);
+    assert.deepEqual(report.weeklyHistory.map(period => period.rows.map(row => [row.model, row.requests])), [
+        [['historical', 1]],
+    ]);
+});
+
+test('overlapping quota evidence is excluded or bounded by the last confirmed historical sample', async t =>
+{
+    const f = await fixture(t);
+    const oldSample = '2026-11-11T09:00:00Z';
+    await f.write('sessions/active.jsonl', [quota(Stamp, '2026-11-19T12:00:00Z', 65),
+        quota('2026-11-13T09:00:00Z', '2026-11-15T12:00:00Z', 25),
+        quota('2026-11-08T09:00:00Z', '2026-11-14T12:00:00Z', 40),
+        quota(oldSample, '2026-11-13T12:00:00Z', 75),
+        modern('confirmed', { timestamp: oldSample, model: 'confirmed' }),
+        modern('ambiguous', { timestamp: '2026-11-11T10:00:00Z', model: 'ambiguous' }),
+        modern('current', { timestamp: Stamp, model: 'current' })]);
+    const report = await f.collector().scan();
+    assert.deepEqual(report.weekly.rows.map(row => row.model), ['current']);
+    assert.deepEqual(report.weeklyHistory.map(period => [period.endAt, period.partial,
+        period.rows.map(row => row.model)]), [[Date.parse(oldSample), true, ['confirmed']]]);
+});
+
+test('an overlapping inferred history start bills from its first independently observed sample', async t =>
+{
+    const f = await fixture(t);
+    const newerStart = '2026-11-06T10:00:00Z';
+    const newerFull = '2026-11-10T10:00:00Z';
+    const olderSample = '2026-11-04T12:00:00Z';
+    await f.write('sessions/active.jsonl', [quota(Stamp, '2026-11-19T12:00:00Z', 65),
+        quota(newerStart, '2026-11-12T12:00:00Z', 35), quota(newerFull, '2026-11-12T12:00:00Z', 100),
+        quota(olderSample, '2026-11-06T12:00:00Z', 75),
+        modern('older-sample', { timestamp: olderSample, model: 'older' }),
+        modern('overlap', { timestamp: '2026-11-05T15:00:00Z', model: 'overlap' }),
+        modern('newer-full', { timestamp: newerFull, model: 'newer' })]);
+    const { weeklyHistory } = await f.collector().scan();
+    assert.deepEqual(weeklyHistory.map(period => [period.startAt, period.endAt, period.fullAt, period.partial,
+        period.rows.map(row => row.model)]), [
+        [Date.parse(newerStart), Date.parse('2026-11-12T12:00:00Z') - 1, Date.parse(newerFull), true, ['newer']],
+        [Date.parse('2026-10-30T12:00:00Z'), Date.parse(olderSample), null, true, ['older']],
+    ]);
+});
+
+test('an overlapping inferred current start omits the ambiguous prefix and preserves the full response', async t =>
+{
+    const f = await fixture(t);
+    const currentSample = '2026-11-16T12:00:00Z';
+    const olderSample = '2026-11-11T11:00:00Z';
+    await f.write('sessions/active.jsonl', [quota(currentSample, '2026-11-19T12:00:00Z', 100),
+        quota(olderSample, '2026-11-15T12:00:00Z', 75),
+        modern('old', { timestamp: olderSample, model: 'old' }),
+        modern('ambiguous', { timestamp: '2026-11-13T12:00:00Z', model: 'ambiguous' }),
+        modern('full', { timestamp: currentSample, model: 'full' })]);
+    const { weekly, weeklyHistory } = await f.collector().scan();
+    assert.equal(weekly.startAt, Date.parse(currentSample));
+    assert.equal(weekly.startKind, 'observed');
+    assert.equal(weekly.fullAt, Date.parse(currentSample));
+    assert.deepEqual(weekly.rows.map(row => row.model), ['full']);
+    assert.deepEqual(weeklyHistory.map(period => [period.endAt, period.partial, period.rows.map(row => row.model)]),
+        [[Date.parse(olderSample), true, ['old']]]);
+});
+
+test('an overlapping disputed reset supported by an older adjacent reset preserves a missing history slot', async t =>
+{
+    const f = await fixture(t);
+    const currentSample = '2026-11-16T12:00:00Z';
+    const disputedSample = '2026-11-14T10:00:00Z';
+    const olderSample = '2026-11-07T18:00:00Z';
+    await f.write('sessions/active.jsonl', [quota(currentSample, '2026-11-19T12:00:00Z', 65),
+        quota(disputedSample, '2026-11-15T12:00:00Z', 50), quota(olderSample, '2026-11-08T12:00:00Z', 75),
+        modern('old', { timestamp: olderSample, model: 'old' }),
+        modern('disputed', { timestamp: disputedSample, model: 'disputed' }),
+        modern('current', { timestamp: currentSample, model: 'current' })]);
+    const { weekly, weeklyHistory } = await f.collector().scan();
+    assert.deepEqual(weekly.rows.map(row => row.model), ['current']);
+    assert.deepEqual(weeklyHistory.map(period => period && [period.endAt, period.rows.map(row => row.model)]),
+        [null, [Date.parse('2026-11-08T12:00:00Z') - 1, ['old']]]);
+});
+
+test('a quota sample at the exact reset does not erase the prior cycle and its known first full response', async t =>
+{
+    const f = await fixture(t);
+    const reset = '2026-11-12T12:00:00Z';
+    const full = '2026-11-07T08:00:00Z';
+    await f.write('sessions/active.jsonl', [quota('2026-11-06T02:00:00Z', reset, 40),
+        quota(full, reset, 100), quota(reset, reset, 100), quota('2026-11-12T13:00:00Z', '2026-11-19T12:00:00Z', 4),
+        quota('2026-11-16T12:00:00Z', '2026-11-19T12:00:00Z', 20),
+        modern('full', { timestamp: full, model: 'full' }),
+        modern('reset', { timestamp: reset, model: 'reset' })]);
+    const { weekly, weeklyHistory } = await f.collector().scan();
+    assert.deepEqual(weekly.rows.map(row => row.model), ['reset']);
+    assert.deepEqual(weeklyHistory.map(period => [period.endAt, period.fullAt, period.rows.map(row => row.model)]),
+        [[Date.parse(reset) - 1, Date.parse(full), ['full']]]);
+});
+
+test('an ordinary pre-reset reading survives an exact reset and invalidates only the affected old cache', async t =>
+{
+    const f = await fixture(t);
+    const reset = '2026-11-12T12:00:00Z';
+    const priorSample = '2026-11-07T08:00:00Z';
+    const prior = await f.write('sessions/prior.jsonl', [quota('2026-11-06T02:00:00Z', reset, 40),
+        quota(priorSample, reset, 70), quota(reset, reset, 75)]);
+    await f.write('sessions/current.jsonl', [quota('2026-11-12T13:00:00Z', '2026-11-19T12:00:00Z', 4),
+        quota('2026-11-16T12:00:00Z', '2026-11-19T12:00:00Z', 20)]);
+    const first = f.collector();
+    const report = await first.scan();
+    assert.deepEqual(report.weeklyHistory.map(period => [period.sampleAt, period.usedPercent, period.endAt]),
+        [[Date.parse(priorSample), 70, Date.parse(reset) - 1]]);
+    await first.dispose();
+
+    const key = createHash('sha256').update(path.relative(f.home, prior)).digest('hex');
+    const cacheDirectory = path.join(f.cacheDir, 'usage-cache');
+    for (const name of await fs.readdir(cacheDirectory))
+    {
+        const filename = path.join(cacheDirectory, name);
+        const cache = JSON.parse(await fs.readFile(filename, 'utf8'));
+        for (const sample of cache.data.weeklySamples) delete sample.beforeJitter;
+        if (name === key + '.json')
+            Object.assign(cache.data.weeklySamples[0], { sampleAt: Date.parse(reset), usedPercent: 75 });
+        await fs.writeFile(filename, JSON.stringify(cache));
+    }
+
+    const next = f.collector();
+    const repaired = await next.scan();
+    assert.equal(repaired.coverage.parsedFiles, 1);
+    assert.equal(repaired.coverage.cachedFiles, 1);
+    assert.deepEqual(repaired.weeklyHistory, report.weeklyHistory);
+    const cached = await next.scan();
+    assert.equal(cached.coverage.cachedFiles, 2);
+    assert.deepEqual(cached.weeklyHistory, report.weeklyHistory);
+});
+
+test('overlapping reset jitter retains an ordinary reading recorded before either advertised boundary', async t =>
+{
+    const f = await fixture(t);
+    const reset = '2026-11-12T12:00:00Z';
+    const laterReset = '2026-11-12T12:00:19Z';
+    const visibleSample = '2026-11-11T11:00:00Z';
+    await f.write('sessions/prior.jsonl', [quota('2026-11-07T08:00:00Z', reset, 68),
+        quota(visibleSample, laterReset, 70), quota('2026-11-12T12:00:11Z', laterReset, 75)]);
+    await f.write('sessions/current.jsonl', [quota('2026-11-12T13:00:00Z', '2026-11-19T12:00:00Z', 4),
+        quota('2026-11-16T12:00:00Z', '2026-11-19T12:00:00Z', 20)]);
+    const collector = f.collector();
+    const { weeklyHistory } = await collector.scan();
+    assert.deepEqual(weeklyHistory.map(period => [period.sampleAt, period.usedPercent, period.endAt]),
+        [[Date.parse(visibleSample), 70, Date.parse(reset) - 1]]);
+    const cached = await collector.scan();
+    assert.equal(cached.coverage.cachedFiles, 2);
+    assert.deepEqual(cached.weeklyHistory, weeklyHistory);
+});

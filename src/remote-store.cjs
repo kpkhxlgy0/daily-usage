@@ -131,13 +131,15 @@ function createRemoteStore({ now = Date.now } = {}) {
                     return value;
                 } catch (error) {
                     if (signal.aborted || disposed) throw aborted();
-                    if (file === paths.capabilitiesV2) return null;
+                    if (file !== paths.capabilities) return null;
                     if (error.code === "ENOENT") throw failure("snapshot-update-required");
                     throw error;
                 }
             };
             const peer = await capabilities();
-            const weeklyPeer = await capabilities(paths.capabilitiesV2);
+            let snapshotVersion = 1;
+            if ((await capabilities(paths.capabilitiesV3))?.publisherId === peer.publisherId) snapshotVersion = 3;
+            else if ((await capabilities(paths.capabilitiesV2))?.publisherId === peer.publisherId) snapshotVersion = 2;
             try {
                 subscription = await bounded(childSignal => {
                     const pending = Promise.resolve(watch(paths.responses, { signal }));
@@ -156,7 +158,7 @@ function createRemoteStore({ now = Date.now } = {}) {
                 throw failure("snapshot-update-required");
             }
             marker = makeMarker(randomUUID(), now());
-            if (weeklyPeer?.publisherId === peer.publisherId) marker.snapshotVersion = 2;
+            if (snapshotVersion > 1) marker.snapshotVersion = snapshotVersion;
             markerPath = target.pathApi.join(paths.requests, `${marker.requestId}.json`);
             const responsePath = target.pathApi.join(paths.responses, `${marker.requestId}.json`);
             markerAttempted = true;
@@ -173,7 +175,7 @@ function createRemoteStore({ now = Date.now } = {}) {
                 }
                 if (value !== undefined) {
                     const checked = validateResult(value, { requestId: marker.requestId,
-                        publisherId: peer.publisherId, now: now() });
+                        publisherId: peer.publisherId, now: now(), snapshotVersion });
                     if (!checked.ok) throw failure(`snapshot-${checked.reason}`);
                     if (value.updatedAt + FutureSkewMs < marker.requestedAt) throw failure("snapshot-replay");
                     if (value.status === "error") throw failure("snapshot-unavailable");

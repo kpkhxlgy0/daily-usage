@@ -6,7 +6,7 @@ const { createHash, randomUUID } = require('node:crypto');
 const { createRolloutReader } = require('./vendor/rollout-reader.cjs');
 const { createLogParser } = require('./log-parser.cjs');
 const { priceRequest, Pricing, validTokens } = require('./pricing.cjs');
-const { validWeeklyData, weeklyWindow } = require('./weekly-quota.cjs');
+const { validWeeklyData, weeklyWindows } = require('./weekly-quota.cjs');
 
 const DayMs = 24 * 60 * 60 * 1000;
 const BeijingOffsetMs = 8 * 60 * 60 * 1000;
@@ -239,13 +239,21 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
             progress('scanning', coverage, ++processedFiles);
         }
         checkActive();
-        const window = weeklyWindow(data, generatedAt);
-        const weeklyEnd = window && (window.fullAt ?? generatedAt);
-        const weeklyRows = new Map();
+        const { current, history } = weeklyWindows(data, generatedAt, cutoff);
+        function trackWeekly(window, endAt)
+        {
+            return window && { window, endAt: window.fullAt ?? endAt, rows: new Map() };
+        }
+        const currentUsage = trackWeekly(current, generatedAt);
+        const historicalUsage = history.map(period => trackWeekly(period, period?.endAt));
+        const weeklyUsage = [currentUsage, ...historicalUsage].filter(Boolean);
         const earlierCopies = new Map();
         function includeWeekly(event, timestamp, estimated = false)
         {
-            if (!window || timestamp < window.startAt || timestamp > weeklyEnd) return;
+            if (timestamp < cutoff) return;
+            const period = weeklyUsage.find(({ window, endAt }) => timestamp >= window.startAt && timestamp <= endAt);
+            if (!period) return;
+            const weeklyRows = period.rows;
             let row = weeklyRows.get(event.model);
             if (!row)
             {
@@ -315,9 +323,9 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
                 {
                     coverage.duplicateRequests++;
                     const previous = responses.get(event.id);
-                    if (window && event.timestamp < (earlierCopies.get(event.id) ?? previous.timestamp))
+                    if (weeklyUsage.length && event.timestamp < (earlierCopies.get(event.id) ?? previous.timestamp))
                     {
-                        // 分叉副本的时间不得把已经发生的请求带入当前周窗口。
+                        // 分叉副本的时间不得把已经发生的请求带入较新的周窗口。
                         earlierCopies.set(event.id, event.timestamp);
                     }
                     if (usageKey(previous) !== usageKey(event) || previous.model !== event.model)
@@ -330,7 +338,7 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
                 include(event);
             }
         }
-        if (window)
+        if (weeklyUsage.length)
         {
             for (const event of responses.values()) includeWeekly(event, earlierCopies.get(event.id) ?? event.timestamp);
         }
@@ -469,15 +477,20 @@ function createCollector({ codexHome, cacheDir, now = Date.now, onProgress } = {
         if (coverage.cacheErrors) coverage.warnings.push('用量缓存写入失败，仍显示已读取的统计。');
         const result = [...rows.values()].sort((a, b) => b.date.localeCompare(a.date) || a.model.localeCompare(b.model));
         for (const row of result) row.usd = Number(row.usd.toFixed(12));
-        const weekly = window ? { ...window, rows: [...weeklyRows.values()]
-            .sort((a, b) => a.model.localeCompare(b.model)) } : null;
-        for (const row of weekly?.rows || [])
+        function weeklyReport(period)
         {
-            row.baseUsd = Number(row.baseUsd.toFixed(12));
-            row.usd = Number(row.usd.toFixed(12));
+            if (!period) return null;
+            const rows = [...period.rows.values()].sort((a, b) => a.model.localeCompare(b.model));
+            for (const row of rows)
+            {
+                row.baseUsd = Number(row.baseUsd.toFixed(12));
+                row.usd = Number(row.usd.toFixed(12));
+            }
+            return { ...period.window, rows };
         }
         progress('complete', coverage, processedFiles);
-        return { generatedAt, timezone: 'Asia/Shanghai', from, to, rows: result, weekly, coverage, pricing: { ...Pricing } };
+        return { generatedAt, timezone: 'Asia/Shanghai', from, to, rows: result, weekly: weeklyReport(currentUsage),
+            weeklyHistory: historicalUsage.map(weeklyReport), coverage, pricing: { ...Pricing } };
     }
 
     return {

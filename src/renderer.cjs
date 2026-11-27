@@ -14,6 +14,9 @@ const weeklyTime = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai',
 const weeklyDollars = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD',
     minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const weeklyPercent = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 });
+const WeekLabels = ['本轮', '上一轮', '上两轮', '上三轮'];
+const WeeklyCoverageGaps = ['failedFiles', 'skippedRecords', 'discoveryErrors',
+    'oversizedRecords', 'conflictingRequests', 'legacySkippedRecords'];
 
 function localDate(milliseconds)
 {
@@ -52,24 +55,9 @@ function weeklyMoney(row, value)
         + (row.unpricedRequests ? ' + 未定价部分' : '');
 }
 
-function renderWeekly(section, snapshot, hostLabel, endLabel)
+function weeklyTotals(rows)
 {
-    const weekly = snapshot?.weekly;
-    const date = section.querySelector('[data-weekly-period]');
-    const observation = section.querySelector('[data-weekly-observation]');
-    const limit = section.querySelector('progress[aria-label="周额度已用"]');
-    const empty = section.querySelector('[data-weekly-empty]');
-    const coverage = section.querySelector('[data-weekly-coverage]');
-    const updated = section.querySelector('[data-weekly-updated]');
-    const table = section.querySelector('.daily-usage-scroll');
-    const body = table.querySelector('tbody');
-    const rows = weekly?.rows || [];
-    const logCoverage = snapshot?.coverage;
-    const coverageGap = weekly?.startKind === 'observed' || logCoverage?.failedFiles
-        || logCoverage?.skippedRecords || logCoverage?.discoveryErrors || logCoverage?.warnings.length;
-    body.replaceChildren();
-    table.hidden = rows.length === 0;
-    const totals = rows.reduce((sum, row) =>
+    return rows.reduce((sum, row) =>
     {
         sum.requests += row.requests;
         sum.usd += row.usd;
@@ -77,8 +65,150 @@ function renderWeekly(section, snapshot, hostLabel, endLabel)
         sum.estimatedRequests += row.estimatedRequests;
         return sum;
     }, { requests: 0, usd: 0, unpricedRequests: 0, estimatedRequests: 0 });
+}
+
+function hasPartialWeek(week, coverage)
+{
+    return week?.partial === true || week?.startKind === 'observed'
+        || WeeklyCoverageGaps.some(field => coverage?.[field] > 0);
+}
+
+function weeklyScanWarning(coverage)
+{
+    const warnings = [...coverage.warnings];
+    if (!warnings.length)
+    {
+        if (coverage.failedFiles) warnings.push(coverage.failedFiles + ' 个日志读取失败');
+        if (coverage.skippedRecords) warnings.push(coverage.skippedRecords + ' 条记录无法归属');
+    }
+    return warnings.length ? '近 30 天日志扫描 · ' + warnings.join(' ') : '';
+}
+
+function appendComparisonAmount(tr, column, row)
+{
+    const cell = tr.insertCell();
+    if (!column)
+    {
+        cell.textContent = '—';
+        cell.title = '无周期记录';
+        return;
+    }
+    if (row && !hasWeeklyPrice(row, row.usd))
+    {
+        cell.textContent = '未定价';
+        return;
+    }
+    const usd = row?.usd ?? 0;
+    cell.textContent = usd === 0 && column.coverageGap ? '—' : weeklyDollars.format(usd);
+    if (usd === 0 && column.coverageGap) cell.title = '日志覆盖不全，金额暂不可用';
+    const notes = [];
+    if (row?.estimatedRequests) notes.push('含估算');
+    if (row?.unpricedRequests) notes.push('部分未定价');
+    if (notes.length)
+    {
+        const note = tr.ownerDocument.createElement('small');
+        note.textContent = notes.join(' · ');
+        cell.append(note);
+    }
+}
+
+function renderWeeklyComparison(section, snapshot, cycles, endLabel)
+{
+    const doc = section.ownerDocument;
+    const table = section.querySelector('table');
+    const head = table.tHead.rows[0];
+    const body = table.tBodies[0];
+    const footer = table.tFoot.rows[0];
+    const header = head.cells[0];
+    const totalHeader = footer.cells[0];
+    head.replaceChildren(header);
+    body.replaceChildren();
+    footer.replaceChildren(totalHeader);
+
+    const modelCosts = new Map();
+    const columns = cycles.map((week, index) =>
+    {
+        const cell = doc.createElement('th');
+        cell.scope = 'col';
+        head.append(cell);
+        const heading = doc.createElement(week ? 'button' : 'span');
+        heading.className = 'daily-usage-cycle-heading';
+        cell.append(heading);
+        const label = doc.createElement('span');
+        label.className = 'daily-usage-cycle-label';
+        label.textContent = WeekLabels[index];
+        heading.append(label);
+        if (!week)
+        {
+            const missing = doc.createElement('small');
+            missing.textContent = '无记录';
+            heading.append(missing);
+            return null;
+        }
+
+        heading.type = 'button';
+        heading.dataset.weeklyCycle = index;
+        const date = doc.createElement('time');
+        date.dateTime = localDate(week.startAt);
+        date.textContent = date.dateTime.slice(5).replace('-', '/') + ' 起';
+        heading.append(date);
+        const partial = hasPartialWeek(week, snapshot.coverage);
+        if (partial)
+        {
+            const note = doc.createElement('small');
+            note.textContent = '部分覆盖';
+            heading.append(note);
+        }
+
+        const rows = new Map();
+        for (const row of week.rows)
+        {
+            rows.set(row.model, row);
+            modelCosts.set(row.model, (modelCosts.get(row.model) || 0) + row.usd);
+        }
+        return { rows, totals: weeklyTotals(week.rows), coverageGap: partial };
+    });
+    const highestTotal = Math.max(...columns.map(column => column?.totals.usd ?? 0));
+    table.style.setProperty('--daily-usage-amount-width', weeklyDollars.format(highestTotal).length + 'ch');
+    const models = [...modelCosts].sort(([a, aUsd], [b, bUsd]) => bUsd - aUsd || a.localeCompare(b));
+    for (const [model] of models)
+    {
+        const tr = body.insertRow();
+        const name = doc.createElement('th');
+        name.scope = 'row';
+        name.textContent = model;
+        tr.append(name);
+        for (const column of columns) appendComparisonAmount(tr, column, column?.rows.get(model));
+    }
+    for (const column of columns) appendComparisonAmount(footer, column, column?.totals);
+    section.querySelector('[data-weekly-comparison-empty]').textContent = cycles.some(Boolean)
+        ? '' : '暂无周额度观测记录。';
+    section.querySelector('[data-weekly-comparison-updated]').textContent =
+        endLabel + ' ' + weeklyTime.format(snapshot.generatedAt) + '（北京时间）';
+    section.querySelector('[data-weekly-comparison-coverage]').textContent = weeklyScanWarning(snapshot.coverage);
+}
+
+function renderWeekly(section, snapshot, weekly, hostLabel, endLabel, cycleLabel)
+{
+    const date = section.querySelector('[data-weekly-period]');
+    const observation = section.querySelector('[data-weekly-observation]');
+    const limit = section.querySelector('progress[aria-label="周额度已用"]');
+    const empty = section.querySelector('[data-weekly-empty]');
+    const coverage = section.querySelector('[data-weekly-coverage]');
+    const updated = section.querySelector('[data-weekly-updated]');
+    const table = section.querySelector('.daily-usage-scroll');
+    const cycle = cycleLabel || '本轮';
+    table.querySelector('table').setAttribute('aria-label', cycle + '周额度模型用量');
+    const body = table.querySelector('tbody');
+    const rows = weekly?.rows || [];
+    const historical = Number.isFinite(weekly?.endAt);
+    const logCoverage = snapshot?.coverage;
+    const partial = hasPartialWeek(weekly, logCoverage);
+    body.replaceChildren();
+    table.hidden = rows.length === 0;
+    const totals = weeklyTotals(rows);
     section.querySelector('[data-weekly-host]').textContent = hostLabel + '请求数（含子代理）';
-    section.querySelector('[data-weekly-summary="usd"]').textContent = weekly && (rows.length || !coverageGap)
+    section.querySelector('[data-weekly-summary="usd"]').textContent = weekly && (!partial || totals.usd > 0)
         ? weeklyMoney(totals, totals.usd) : '—';
     section.querySelector('[data-weekly-summary="requests"]').textContent = weekly
         ? counts.format(totals.requests) : '—';
@@ -105,18 +235,21 @@ function renderWeekly(section, snapshot, hostLabel, endLabel)
     const startLabel = weekly.startKind === 'reset' ? '重置'
         : weekly.startKind === 'inferred' ? '按重置时间推算' : '自首次观测';
     const end = weekly.fullAt === null
-        ? endLabel + ' ' + weeklyTime.format(snapshot.generatedAt)
+        ? (historical ? '统计截至' : endLabel) + ' ' + weeklyTime.format(weekly.endAt ?? snapshot.generatedAt)
         : '首次满额 ' + weeklyTime.format(weekly.fullAt);
-    date.textContent = startLabel + ' ' + weeklyTime.format(weekly.startAt) + ' → ' + end + '（北京时间）'
-        + (weekly.startKind === 'observed' ? ' · 部分覆盖' : '');
-    if (weekly.fullAt !== null)
+    const cyclePrefix = cycleLabel ? cycleLabel + ' · ' : '';
+    date.textContent = cyclePrefix + startLabel + ' ' + weeklyTime.format(weekly.startAt)
+        + ' → ' + end + '（北京时间）' + (partial ? ' · 部分覆盖' : '');
+    if (historical || weekly.fullAt !== null)
     {
-        updated.textContent = endLabel + ' ' + weeklyTime.format(snapshot.generatedAt) + '（北京时间）';
+        const cycleEnd = historical && weekly.fullAt !== null
+            ? '覆盖截至 ' + weeklyTime.format(weekly.endAt) + '（北京时间） · ' : '';
+        updated.textContent = cycleEnd + endLabel + ' ' + weeklyTime.format(snapshot.generatedAt) + '（北京时间）';
     }
     if (!rows.length)
     {
-        empty.textContent = hostLabel + '可读日志范围内，本轮没有可统计的请求。'
-            + (coverageGap ? '已有覆盖缺口，金额暂不可用。' : '');
+        empty.textContent = hostLabel + '可读日志范围内，' + cycle + '没有可统计的请求。'
+            + (partial ? '已有覆盖缺口，金额暂不可用。' : '');
     }
 
     const gaps = [];
@@ -126,13 +259,8 @@ function renderWeekly(section, snapshot, hostLabel, endLabel)
             + (totals.usd > 0 ? '，金额占比按已定价金额计算' : ''));
     }
     if (totals.estimatedRequests) gaps.push(counts.format(totals.estimatedRequests) + ' 次请求含估算');
-    const scanWarnings = [...logCoverage.warnings];
-    if (!scanWarnings.length)
-    {
-        if (logCoverage.failedFiles) scanWarnings.push(logCoverage.failedFiles + ' 个日志读取失败');
-        if (logCoverage.skippedRecords) scanWarnings.push(logCoverage.skippedRecords + ' 条记录无法归属');
-    }
-    if (scanWarnings.length) gaps.push('近 30 天日志扫描 · ' + scanWarnings.join(' '));
+    const scanWarning = weeklyScanWarning(logCoverage);
+    if (scanWarning) gaps.push(scanWarning);
     coverage.textContent = gaps.join('；');
     const doc = section.ownerDocument;
     const orderedRows = [...rows].sort((a, b) => b.usd - a.usd || a.model.localeCompare(b.model));
@@ -181,6 +309,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
     let fetching = false;
     let visible = false;
     let activeQuery;
+    let selectedCycle = null;
     const hostNames = new Map([['local', '本机']]);
     const panel = doc.createElement('section');
     panel.className = 'daily-usage-panel';
@@ -213,15 +342,36 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         .daily-usage-weekly .daily-usage-card small:last-child { margin:4px 0 0; }
         .daily-usage-weekly progress { width:100%; height:8px; accent-color:#229982; }
         .daily-usage-weekly caption { text-align:left; font-size:16px; font-weight:600; padding:0 0 8px; }
-        .daily-usage-weekly :is(th, td):nth-child(4) { font-weight:700; background:#22998214; }
+        .daily-usage-weekly [data-weekly-detail] :is(th, td):nth-child(4) { font-weight:700; background:#22998214; }
         .daily-usage-share { display:inline-flex; align-items:center; gap:8px; }
         .daily-usage-share progress { width:clamp(64px, 12vw, 128px); height:6px; }
         .daily-usage-weekly td:first-child { white-space:normal; overflow-wrap:anywhere; min-width:100px; }
         .daily-usage-panel .daily-usage-weekly :is(th, td):nth-child(2) { text-align:right; }
+        .daily-usage-panel [data-weekly-comparison] .daily-usage-scroll { max-height:max(20rem, 64vh); scrollbar-gutter:stable; }
+        .daily-usage-panel [data-weekly-comparison] table { --daily-usage-cycle-share:calc(.75 / 4);
+            min-width:max(490px, calc((var(--daily-usage-amount-width, 0ch) + 24px) / var(--daily-usage-cycle-share)));
+            table-layout:fixed; border-collapse:separate; border-spacing:0; font-variant-numeric:tabular-nums; }
+        .daily-usage-panel [data-weekly-comparison] :is(th, td) { vertical-align:top; line-height:1.45; }
+        .daily-usage-panel [data-weekly-comparison] :is(th, td):nth-child(2) {
+            background-image:linear-gradient(#22998214, #22998214); }
+        .daily-usage-panel [data-weekly-comparison] th:first-child { white-space:normal; overflow-wrap:anywhere; }
+        .daily-usage-panel [data-weekly-comparison] thead th:not(:first-child) {
+            width:calc(100% * var(--daily-usage-cycle-share)); text-align:right; padding:0; }
+        .daily-usage-panel [data-weekly-comparison] .daily-usage-cycle-heading { display:block; width:100%;
+            margin:0; border:0; padding:10px 12px; font:inherit; text-align:inherit; background:none; }
+        .daily-usage-panel [data-weekly-comparison] .daily-usage-cycle-label { display:block; }
+        .daily-usage-panel [data-weekly-comparison] th button:hover { background:#8882; }
+        .daily-usage-panel [data-weekly-comparison] button .daily-usage-cycle-label {
+            text-decoration:underline; text-underline-offset:3px; }
+        .daily-usage-panel [data-weekly-comparison] :is(time, small) { display:block; margin-top:3px;
+            font-size:11px; font-weight:400; opacity:.8; white-space:normal; overflow-wrap:anywhere; }
+        .daily-usage-panel [data-weekly-comparison] tfoot :is(th, td) { position:sticky; bottom:0; z-index:1;
+            background-color:var(--color-token-bg-primary, var(--daily-usage-comparison-bg, Canvas));
+            border-top:1px solid #8885; font-weight:700; }
     </style>
     <header><h2>Daily Usage</h2><select aria-label="统计机器"><option value="local">本机</option></select>
     <select aria-label="统计时间范围"><option value="1">今天</option><option value="7">最近 7 天</option>
-    <option value="30">最近 30 天</option><option value="weekly">本轮周额度</option></select><button type="button" data-refresh>刷新</button></header>
+    <option value="30">最近 30 天</option><option value="weekly">周额度历史</option></select><button type="button" data-refresh>刷新</button></header>
     <p data-calendar-note>北京时间 · 包含子代理 · 按公开 Standard API 基础单价折算，不叠加长上下文或缓存保留时长加价；缓存写入按普通输入价计一次，金额不代表订阅账单。</p>
     <div data-status role="status" aria-live="polite">正在读取统计…</div>
     <div data-calendar>
@@ -236,25 +386,43 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
     <p data-empty></p><p>机器列表包含本机和本窗口打开过的远程会话。远程机器需要安装并启用 Daily Usage。</p>
     <p data-price></p></div>
     <div class="daily-usage-weekly" data-weekly hidden>
-        <p class="daily-usage-period" data-weekly-period></p>
-        <div class="daily-usage-cards">
-            <div class="daily-usage-card"><small>API 等价金额（USD）</small><strong data-weekly-summary="usd">—</strong>
-                <small>Standard 含长上下文</small></div>
-            <div class="daily-usage-card"><small>周额度已用</small><strong data-weekly-summary="percent">—</strong>
-                <progress aria-label="周额度已用" max="100" value="0" hidden></progress>
-                <p data-weekly-observation></p></div>
-            <div class="daily-usage-card"><small data-weekly-host>本机请求数（含子代理）</small>
-                <strong data-weekly-summary="requests">—</strong></div>
+        <div data-weekly-comparison hidden>
+            <p>起始日期为北京时间 · Standard 含长上下文</p>
+            <div class="daily-usage-scroll" role="region" aria-label="周额度费用对比表" tabindex="0">
+                <table aria-label="周额度历史对比">
+                    <caption>API 等价金额（USD）</caption>
+                    <thead><tr><th scope="col">模型</th></tr></thead>
+                    <tbody></tbody><tfoot><tr><th scope="row">合计</th></tr></tfoot>
+                </table>
+            </div>
+            <p data-weekly-comparison-empty role="status"></p>
+            <p data-weekly-comparison-updated></p>
+            <p data-weekly-comparison-coverage></p>
         </div>
-        <p data-weekly-empty role="status"></p>
-        <div class="daily-usage-scroll" role="region" aria-label="模型费用列表" tabindex="0" hidden>
-            <table aria-label="本轮周额度模型用量">
-                <caption>按模型统计</caption><thead><tr>
-                <th scope="col">模型</th><th scope="col">请求数</th><th scope="col">基础价（USD）</th>
-                <th scope="col" aria-sort="descending">含长上下文（USD）</th><th scope="col">金额占比</th>
-            </tr></thead><tbody></tbody></table>
+        <div data-weekly-detail>
+            <button type="button" data-weekly-back hidden>返回周额度对比</button>
+            <p data-weekly-current-only hidden>本次汇总仅提供本轮明细。</p>
+            <p class="daily-usage-period" data-weekly-period></p>
+            <div class="daily-usage-cards">
+                <div class="daily-usage-card"><small>API 等价金额（USD）</small>
+                    <strong data-weekly-summary="usd">—</strong><small>Standard 含长上下文</small></div>
+                <div class="daily-usage-card"><small>周额度已用</small>
+                    <strong data-weekly-summary="percent">—</strong>
+                    <progress aria-label="周额度已用" max="100" value="0" hidden></progress>
+                    <p data-weekly-observation></p></div>
+                <div class="daily-usage-card"><small data-weekly-host>本机请求数（含子代理）</small>
+                    <strong data-weekly-summary="requests">—</strong></div>
+            </div>
+            <p data-weekly-empty role="status"></p>
+            <div class="daily-usage-scroll" role="region" aria-label="模型费用列表" tabindex="0" hidden>
+                <table aria-label="本轮周额度模型用量">
+                    <caption>按模型统计</caption><thead><tr>
+                    <th scope="col">模型</th><th scope="col">请求数</th><th scope="col">基础价（USD）</th>
+                    <th scope="col" aria-sort="descending">含长上下文（USD）</th><th scope="col">金额占比</th>
+                </tr></thead><tbody></tbody></table>
+            </div>
+            <p data-weekly-updated></p><p data-weekly-coverage></p>
         </div>
-        <p data-weekly-updated></p><p data-weekly-coverage></p>
         <p>周额度显示最近一次观测值。费用按 Standard API 价格折算，订阅账单以服务商为准。</p>
     </div>`;
     root.append(panel);
@@ -265,6 +433,10 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
     const calendar = panel.querySelector('[data-calendar]');
     const calendarNote = panel.querySelector('[data-calendar-note]');
     const weekly = panel.querySelector('[data-weekly]');
+    const comparison = weekly.querySelector('[data-weekly-comparison]');
+    const detail = weekly.querySelector('[data-weekly-detail]');
+    const back = detail.querySelector('[data-weekly-back]');
+    const currentOnly = detail.querySelector('[data-weekly-current-only]');
     const body = calendar.querySelector('tbody');
 
     function render()
@@ -284,12 +456,34 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
             : '暂无统计。请在运行端安装并启用 Daily Usage，并等待首次扫描完成。';
         const showWeekly = range.value === 'weekly';
         calendar.hidden = calendarNote.hidden = showWeekly;
-        if (!weekly.hidden && !showWeekly) weekly.querySelector('tbody').replaceChildren();
+        if (!weekly.hidden && !showWeekly)
+        {
+            comparison.querySelector('tbody').replaceChildren();
+            detail.querySelector('tbody').replaceChildren();
+        }
         weekly.hidden = !showWeekly;
         if (showWeekly)
         {
             const endLabel = stale ? '缓存截至' : state === 'loading' ? '上次数据截至' : '当前 · 数据截至';
-            renderWeekly(weekly, snapshot, hostLabel, endLabel);
+            const cycles = Array.isArray(snapshot?.weeklyHistory)
+                ? WeekLabels.map((_, index) => index === 0 ? snapshot.weekly : snapshot.weeklyHistory[index - 1]) : null;
+            const selected = selectedCycle === null ? null : cycles?.[selectedCycle];
+            const showComparison = Boolean(cycles && !selected);
+            comparison.hidden = !showComparison;
+            detail.hidden = showComparison;
+            back.hidden = !selected;
+            currentOnly.hidden = Boolean(cycles) || !snapshot?.weekly;
+            if (showComparison)
+            {
+                const focused = comparison.contains(doc.activeElement) ? doc.activeElement.dataset.weeklyCycle : null;
+                renderWeeklyComparison(comparison, snapshot, cycles, endLabel);
+                if (focused != null) comparison.querySelector('[data-weekly-cycle="' + focused + '"]')?.focus();
+            }
+            else
+            {
+                renderWeekly(detail, snapshot, selected || snapshot?.weekly, hostLabel, endLabel,
+                    WeekLabels[selectedCycle]);
+            }
             return;
         }
         const from = localDate(now() - (Number(range.value) - 1) * DayMs);
@@ -358,6 +552,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         const query = activeQuery = { id: win.crypto.randomUUID() };
         fetching = true;
         refresh.disabled = true;
+        selectedCycle = null;
         reportState = { status: 'loading', snapshot: changed ? undefined : reportState?.snapshot };
         render();
         const selected = host.value;
@@ -365,6 +560,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         {
             const result = await getReport(selected, { requestId: query.id });
             if (!alive || !visibleElement(panel) || version !== requestVersion) return;
+            selectedCycle = null;
             reportState = result;
             render();
         }
@@ -403,7 +599,26 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
     }
 
     host.addEventListener('change', () => { void update(true); });
-    range.addEventListener('change', render);
+    range.addEventListener('change', () =>
+    {
+        selectedCycle = null;
+        render();
+    });
+    comparison.addEventListener('click', event =>
+    {
+        const button = event.target.closest('button[data-weekly-cycle]');
+        if (!button || comparison.hidden) return;
+        selectedCycle = Number(button.dataset.weeklyCycle);
+        render();
+        back.focus();
+    });
+    back.addEventListener('click', () =>
+    {
+        const cycle = selectedCycle;
+        selectedCycle = null;
+        render();
+        comparison.querySelector('[data-weekly-cycle="' + cycle + '"]')?.focus();
+    });
     refresh.addEventListener('click', () => { void update(); });
     const observer = new win.MutationObserver(reconcileVisibility);
     function observeAncestors()

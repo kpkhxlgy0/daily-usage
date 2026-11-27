@@ -31,6 +31,7 @@ const Requests = `${Directory}/requests`;
 const Responses = `${Directory}/responses`;
 const Capabilities = `${Directory}/capabilities.json`;
 const CapabilitiesV2 = `${Directory}/capabilities-v2.json`;
+const CapabilitiesV3 = `${Directory}/capabilities-v3.json`;
 const PriorPricingBases = ["standard", "standard-base-api", "codex-base-estimate"];
 const Base = { schemaVersion: 1, source: "com.kpk.daily-usage", demandVersion: 1 };
 
@@ -51,14 +52,16 @@ function fixture(t) {
         if (method === "thread/read") return state.thread ?? { thread: { id: params.threadId, path: rollout(params.threadId) } };
         const isResult = params.path?.startsWith(`${Responses}/`);
         const isMarker = params.path?.startsWith(`${Requests}/`);
-        assert.ok([Home, Directory, Requests, Responses, Capabilities, CapabilitiesV2].includes(params.path) || isResult || isMarker,
+        const capabilities = [Capabilities, CapabilitiesV2, CapabilitiesV3];
+        assert.ok([Home, Directory, Requests, Responses, ...capabilities].includes(params.path) || isResult || isMarker,
             `Unexpected path ${params.path}`);
         if (method === "fs/getMetadata") {
             if (state.oldPeer && params.path === Capabilities || params.path === CapabilitiesV2 && !state.weeklyPublisher
+                || params.path === CapabilitiesV3 && !state.historyPublisher
                 || isResult && !state.results.has(params.path.split("/").at(-1).slice(0, -5))) {
                 throw Object.assign(new Error("ENOENT private path"), { code: "ENOENT" });
             }
-            const isFile = params.path === Capabilities || params.path === CapabilitiesV2 || isResult || isMarker;
+            const isFile = capabilities.includes(params.path) || isResult || isMarker;
             const info = { isFile, isDirectory: !isFile, isSymlink: false, createdAtMs: 10, modifiedAtMs: 20, size: 100 };
             return state.metadata ? state.metadata(params.path, info) : info;
         }
@@ -72,8 +75,8 @@ function fixture(t) {
             return {};
         }
         assert.equal(method, "fs/readFile");
-        if ([Capabilities, CapabilitiesV2].includes(params.path)) return { dataBase64: Buffer.from(JSON.stringify({ ...Base,
-            publisherId: params.path === Capabilities ? state.publisherId : state.weeklyPublisher })).toString("base64") };
+        if (capabilities.includes(params.path)) return { dataBase64: Buffer.from(JSON.stringify({ ...Base,
+            publisherId: [state.publisherId, state.weeklyPublisher, state.historyPublisher][capabilities.indexOf(params.path)] })).toString("base64") };
         assert.equal(isResult, true);
         const id = params.path.split("/").at(-1).slice(0, -5);
         if (!state.results.has(id)) throw Object.assign(new Error("ENOENT private path"), { code: "ENOENT" });
@@ -117,9 +120,14 @@ test("only opts into weekly snapshots for the active remote publisher that adver
     assert.equal((await f.get()).status, "ok");
     assert.equal(f.markers.at(-1).snapshotVersion, undefined);
     f.weeklyPublisher = PublisherId;
+    f.historyPublisher = NextPublisher;
     f.value = sample({ revision: 2, schemaVersion: 2, weekly: null });
     assert.equal((await f.get()).snapshot.schemaVersion, 2);
     assert.equal(f.markers.at(-1).snapshotVersion, 2);
+    f.historyPublisher = PublisherId;
+    f.value = sample({ revision: 3, schemaVersion: 3, weekly: null, weeklyHistory: [] });
+    assert.deepEqual((await f.get()).snapshot, f.value);
+    assert.equal(f.markers.at(-1).snapshotVersion, 3);
 });
 
 test("one remote query watches before its marker and reads only capabilities and its matching response", async t => {
@@ -674,7 +682,7 @@ test("real two-end filesystem demand uses native notifications, delivers a fresh
     assert.equal(scans, 1);
     assert.equal(watches.size, 0);
     assert.equal(calls.filter(x => x.method === "fs/readFile").every(x =>
-        ["capabilities.json", "capabilities-v2.json"].includes(path.basename(x.params.path))
+        ["capabilities.json", "capabilities-v2.json", "capabilities-v3.json"].includes(path.basename(x.params.path))
         || x.params.path.includes(`${path.sep}responses${path.sep}`)), true);
     const idleCalls = calls.length;
     await new Promise(resolve => setTimeout(resolve, 40));

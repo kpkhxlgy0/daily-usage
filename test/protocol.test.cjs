@@ -41,6 +41,44 @@ test("downgrades only a legacy viewer's wire snapshot and preserves the local we
     assert.equal(modern.weekly, null);
 });
 
+test("weekly history preserves empty slots, ordered disjoint coverage and v1/v2 projections", () => {
+    const { snapshotForPeer } = require("../src/protocol.cjs");
+    const week = { startAt: Now - 3000, startKind: "observed", sampleAt: Now - 2500,
+        fullAt: null, usedPercent: 22, rows: [] };
+    const older = { ...week, startAt: Now - 9000, sampleAt: Now - 7000, endAt: Now - 5000, partial: true };
+    const daily = snapshot();
+    const current = { ...daily, schemaVersion: 2, weekly: week };
+    const history = { ...current, schemaVersion: 3, weeklyHistory: [null, older] };
+    assert.equal(validateSnapshot(history, { now: Now }).ok, true);
+    assert.equal(validateSnapshot({ ...history, weekly: null }, { now: Now }).ok, true);
+    assert.equal(snapshotForPeer(history, 3), history);
+    assert.deepEqual(snapshotForPeer(history, 2), current);
+    assert.deepEqual(snapshotForPeer(history), daily);
+    assert.deepEqual(snapshotForPeer(history, 4), daily);
+    assert.deepEqual(snapshotForPeer(history, "3"), daily);
+    assert.equal(snapshotForPeer(current, 3), current);
+    for (const slots of [null, [older, null, null, null], [older, older],
+        [{ ...older, endAt: week.startAt }], [{ ...older, endAt: Now - 8000 }],
+        [{ ...older, partial: 1 }], [{ ...older, org: "private" }]]) {
+        assert.equal(validateSnapshot({ ...history, weeklyHistory: slots }, { now: Now }).ok, false);
+    }
+});
+
+test("history over the disk snapshot limit keeps an otherwise valid current-week report", () => {
+    const { snapshotWithinLimit } = require("../src/protocol.cjs");
+    const weekly = { startAt: Now - 1000, startKind: "reset", fullAt: null, sampleAt: Now, usedPercent: 5, rows: [] };
+    const current = snapshot({ schemaVersion: 2, weekly });
+    const rows = Array.from({ length: 6500 }, (_, i) => ({ model: "m".repeat(100) + i,
+        requests: 1, baseUsd: 1, usd: 1, estimatedRequests: 0, unpricedRequests: 0 }));
+    const period = { ...weekly, startAt: Now - 5000, sampleAt: Now - 3500, endAt: Now - 3000, partial: false, rows };
+    const oldest = { ...period, startAt: Now - 9000, sampleAt: Now - 7000, endAt: Now - 6000 };
+    const history = { ...current, schemaVersion: 3, weeklyHistory: [period, oldest] };
+    assert.equal(validateSnapshot(history, { now: Now }).reason, "size");
+    assert.deepEqual(snapshotWithinLimit(history, { now: Now }), current);
+    assert.equal(snapshotWithinLimit({ ...history, weeklyHistory: [period, period] }, { now: Now }), null);
+    assert.equal(history.weeklyHistory.length, 2);
+});
+
 test("weekly snapshots carry only bounded per-model amounts and a consistent observed cutoff", () => {
     const row = { model: "example", requests: 2, baseUsd: 1, usd: 1.5, unpricedRequests: 0, estimatedRequests: 1 };
     const weekly = { startAt: Now - 86400000, startKind: "reset", usedPercent: 45.5,

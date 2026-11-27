@@ -22,7 +22,8 @@ function demandPaths(codexHome, pathApi = path) {
     const directory = pathApi.join(codexHome, ".daily-usage");
     return { directory, requests: pathApi.join(directory, "requests"), responses: pathApi.join(directory, "responses"),
         capabilities: pathApi.join(directory, "capabilities.json"),
-        capabilitiesV2: pathApi.join(directory, "capabilities-v2.json") };
+        capabilitiesV2: pathApi.join(directory, "capabilities-v2.json"),
+        capabilitiesV3: pathApi.join(directory, "capabilities-v3.json") };
 }
 
 function makeMarker(requestId, now, action = "query", baseMarker) {
@@ -41,7 +42,7 @@ function makeMarker(requestId, now, action = "query", baseMarker) {
 
 function validateMarker(value, { now = Date.now() } = {}) {
     const keys = ["schemaVersion", "source", "demandVersion", "requestId", "action", "sequence", "requestedAt", "expiresAt"];
-    if (value?.snapshotVersion === 2) keys.push("snapshotVersion");
+    if (value?.snapshotVersion === 2 || value?.snapshotVersion === 3) keys.push("snapshotVersion");
     if (!integer(now) || !fields(value, keys) || !version(value) || !normalizeThreadId(value.requestId)
         || !(value.action === "query" && value.sequence === 1 || value.action === "cancel" && value.sequence === 2)
         || !integer(value.requestedAt) || !integer(value.expiresAt) || value.expiresAt <= value.requestedAt
@@ -55,7 +56,7 @@ function validateCapabilities(value) {
         && normalizeThreadId(value.publisherId) && bounded(value, MaxDemandBytes) ? { ok: true } : invalid("invalid");
 }
 
-function validateResult(value, { requestId, publisherId, now = Date.now() } = {}) {
+function validateResult(value, { requestId, publisherId, now = Date.now(), snapshotVersion = 3 } = {}) {
     const keys = ["schemaVersion", "source", "demandVersion", "requestId", "publisherId", "updatedAt", "status"];
     if (value?.status === "ok") keys.push("snapshot");
     if (value?.status === "error") keys.push("error");
@@ -67,6 +68,7 @@ function validateResult(value, { requestId, publisherId, now = Date.now() } = {}
     if (value.status === "error" && (typeof value.error !== "string"
         || !/^[a-z][a-z0-9-]{0,63}$/.test(value.error))) return invalid("invalid");
     if (value.status === "ok") {
+        if (value.snapshot?.schemaVersion > snapshotVersion) return invalid("invalid");
         const checked = validateSnapshot(value.snapshot, { now });
         if (!checked.ok) return checked;
         if (value.snapshot.publisherId !== publisherId) return invalid("identity");

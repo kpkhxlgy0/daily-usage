@@ -321,8 +321,11 @@ function createDemandServer({ codexHome, service, now = Date.now })
         watcher.on('error', () => { void dispose(); });
         const capabilities = { schemaVersion: 1, source: 'com.kpk.daily-usage', demandVersion: 1, publisherId };
         await atomicWrite(paths.capabilities, capabilities, () => true);
-        try { await atomicWrite(paths.capabilitiesV2, capabilities, () => true); }
-        catch { /* 周快照协商不可用时仍能处理原有日报请求。 */ }
+        for (const file of [paths.capabilitiesV2, paths.capabilitiesV3])
+        {
+            try { await atomicWrite(file, capabilities, () => true); }
+            catch { /* 可选汇总版本单独协商。 */ }
+        }
     })();
 
     function dispose()
@@ -342,7 +345,7 @@ function createDemandServer({ codexHome, service, now = Date.now })
             await ready.catch(() => {});
             await Promise.all([...tasks]);
             if (!rootInfo || !requestInfo || !responseInfo) return;
-            for (const filename of [paths.capabilities, paths.capabilitiesV2])
+            for (const filename of [paths.capabilities, paths.capabilitiesV2, paths.capabilitiesV3])
             {
                 try
                 {

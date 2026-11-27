@@ -1,11 +1,11 @@
 {
   "id": "com.kpk.daily-usage",
   "name": "Daily Usage",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "githubRepo": "kpkhxlgy0/daily-usage",
   "homepage": "https://github.com/kpkhxlgy0/daily-usage",
   "iconUrl": "./icon.svg",
-  "description": "按北京时间查看本机和 Remote Control 机器的每日 Token，以及本轮周额度内各模型的 API 等价金额（USD）。",
+  "description": "按北京时间查看本机和远程机器的每日用量，对比最近四轮周额度中各模型的 API 等价金额（USD）。",
   "author": "kpkhxlgy0",
   "scope": "both",
   "main": "index.js",

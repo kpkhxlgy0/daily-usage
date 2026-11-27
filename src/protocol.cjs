@@ -35,12 +35,14 @@ function validDate(value) {
 }
 
 const WeeklyKeys = ["startAt", "startKind", "fullAt", "sampleAt", "usedPercent", "rows"];
+const HistoryKeys = [...WeeklyKeys, "endAt", "partial"];
+const MaxPreviousWeeks = 3;
 const WeeklyRowKeys = ["model", "requests", "baseUsd", "usd", "unpricedRequests", "estimatedRequests"];
 const amount = value => Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
 
-function validWeekly(week, generatedAt) {
+function validWeekly(week, generatedAt, keys = WeeklyKeys) {
     if (week === null) return true;
-    if (!exactKeys(week, WeeklyKeys) || !["reset", "inferred", "observed"].includes(week.startKind)
+    if (!exactKeys(week, keys) || !["reset", "inferred", "observed"].includes(week.startKind)
         || !integer(week.startAt) || !integer(week.sampleAt)
         || week.startAt > week.sampleAt || week.sampleAt > generatedAt
         || !Number.isFinite(week.usedPercent) || week.usedPercent < 0 || week.usedPercent > 100
@@ -62,20 +64,35 @@ function validWeekly(week, generatedAt) {
     return true;
 }
 
+function validWeeklyHistory(snapshot) {
+    if (!Array.isArray(snapshot.weeklyHistory) || snapshot.weeklyHistory.length > MaxPreviousWeeks) return false;
+    let newerStart = snapshot.weekly?.startAt;
+    for (const period of snapshot.weeklyHistory) {
+        if (period === null) continue;
+        if (!validWeekly(period, snapshot.generatedAt, HistoryKeys) || typeof period.partial !== "boolean"
+            || !integer(period.endAt) || period.endAt < period.sampleAt || period.endAt > snapshot.generatedAt
+            || newerStart !== undefined && period.endAt >= newerStart) return false;
+        newerStart = period.startAt;
+    }
+    return true;
+}
+
 function validateSnapshot(value, options = {}) {
     const invalid = reason => ({ ok: false, reason });
     if (!record(options)) return invalid("invalid");
     const { now = Date.now() } = options;
-    const weeklyFormat = value?.schemaVersion === 2;
-    if (!integer(now) || !exactKeys(value, weeklyFormat ? [...RootKeys, "weekly"] : RootKeys)
-        || !weeklyFormat && value.schemaVersion !== 1
+    const version = value?.schemaVersion;
+    const keys = version === 3 ? [...RootKeys, "weekly", "weeklyHistory"]
+        : version === 2 ? [...RootKeys, "weekly"] : RootKeys;
+    if (!integer(now) || ![1, 2, 3].includes(version) || !exactKeys(value, keys)
         || value.source !== "com.kpk.daily-usage" || !normalizeThreadId(value.machineId)
         || !normalizeThreadId(value.publisherId) || !integer(value.revision) || value.revision === 0
         || !integer(value.generatedAt) || value.timezone !== "Asia/Shanghai"
         || !validDate(value.from) || !validDate(value.to) || value.from > value.to
         || !Array.isArray(value.rows) || value.rows.length > 10000) return invalid("invalid");
     if (value.generatedAt - now > FutureSkewMs) return invalid("future");
-    if (weeklyFormat && !validWeekly(value.weekly, value.generatedAt)) return invalid("invalid");
+    if (version >= 2 && !validWeekly(value.weekly, value.generatedAt)) return invalid("invalid");
+    if (version === 3 && !validWeeklyHistory(value)) return invalid("invalid");
     const identities = new Set();
     for (const row of value.rows) {
         if (!exactKeys(row, RowKeys) || !validDate(row.date) || row.date < value.from || row.date > value.to
@@ -107,10 +124,21 @@ function validateSnapshot(value, options = {}) {
     return { ok: true };
 }
 
-function snapshotForPeer(snapshot, requestedVersion) {
-    if (snapshot.schemaVersion !== 2 || requestedVersion === 2) return snapshot;
-    const { weekly, ...daily } = snapshot;
+function snapshotForPeer(snapshot, requestedVersion = 1) {
+    const version = requestedVersion === 3 || requestedVersion === 2 ? requestedVersion : 1;
+    if (snapshot.schemaVersion <= version) return snapshot;
+    const { weekly, weeklyHistory, ...daily } = snapshot;
+    if (version === 2) return { ...daily, schemaVersion: 2, weekly };
     return { ...daily, schemaVersion: 1 };
+}
+
+function snapshotWithinLimit(snapshot, options) {
+    for (;;) {
+        const checked = validateSnapshot(snapshot, options);
+        if (checked.ok) return snapshot;
+        if (checked.reason !== "size" || snapshot.schemaVersion === 1) return null;
+        snapshot = snapshotForPeer(snapshot, snapshot.schemaVersion - 1);
+    }
 }
 
 function safePath(value) {
@@ -156,5 +184,5 @@ function snapshotContext(rolloutPath, threadId) {
     return null;
 }
 
-module.exports = { validateSnapshot, snapshotForPeer, snapshotContext, normalizeThreadId, validHostId, safePath,
+module.exports = { validateSnapshot, snapshotForPeer, snapshotWithinLimit, snapshotContext, normalizeThreadId, validHostId, safePath,
     MaxSnapshotBytes, StaleAfterMs, FutureSkewMs };

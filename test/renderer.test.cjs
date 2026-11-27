@@ -55,6 +55,228 @@ function selectRange(root, dom, value)
     range.dispatchEvent(new dom.window.Event('change'));
 }
 
+function reportWithHistory()
+{
+    const cycle = (startAt, endAt, rows, partial = false) => ({
+        startKind: 'inferred', startAt: Date.parse(startAt), endAt: Date.parse(endAt),
+        fullAt: null, sampleAt: Date.parse(endAt) - 60000, usedPercent: 62.5, rows, partial
+    });
+    const previous = cycle('2026-11-04T16:30:00Z', '2026-11-11T16:29:59Z', [
+        { model: 'historical-model', requests: 2, baseUsd: 7, usd: 12.75, unpricedRequests: 0, estimatedRequests: 0 },
+        { model: 'large-model', requests: 1, baseUsd: 8, usd: 13.5, unpricedRequests: 0, estimatedRequests: 0 }
+    ]);
+    const oldest = cycle('2026-10-21T16:30:00Z', '2026-10-28T16:29:59Z', [
+        { model: 'large-model', requests: 1, baseUsd: 26.75, usd: 33.75, unpricedRequests: 0, estimatedRequests: 0 }
+    ], true);
+    return { ...snapshot(), schemaVersion: 3, weekly: completedWeek(), weeklyHistory: [previous, null, oldest] };
+}
+
+test('weekly comparison aligns model costs and distinguishes missing, partial, unpriced and zero amounts', async t =>
+{
+    const { root, dom } = await setup(t, async () => ({ status: 'ok', snapshot: reportWithHistory() }));
+    selectRange(root, dom, 'weekly');
+    const table = root.querySelector('table[aria-label="周额度历史对比"]');
+    assert.ok(table);
+    assert.equal(table.closest('[data-weekly-comparison]').hidden, false);
+    assert.equal(table.tHead.rows[0].cells.length, 5);
+    const [, current, previous, missing, oldest] = table.tHead.rows[0].cells;
+    assert.match(current.textContent, /本轮.*11\/12 起/s);
+    assert.match(previous.textContent, /上一轮.*11\/05 起/s);
+    assert.match(missing.textContent, /上两轮.*无记录/s);
+    assert.doesNotMatch(missing.textContent, /\d{2}\/\d{2}/);
+    assert.equal(missing.querySelector('button'), null);
+    assert.match(oldest.textContent, /上三轮.*10\/22 起.*部分覆盖/s);
+    assert.match(root.querySelector('[data-weekly-comparison]').textContent, /北京时间.*含长上下文/s);
+    const models = new Map([...table.tBodies[0].rows].map(row =>
+        [row.cells[0].textContent, [...row.cells].slice(1).map(cell => cell.textContent)]));
+    assert.match(models.get('large-model')[0], /\$1,856\.32.*估算/);
+    assert.deepEqual(models.get('large-model').slice(1), ['$13.50', '—', '$33.75']);
+    assert.deepEqual(models.get('historical-model'), ['$0.00', '$12.75', '—', '—']);
+    assert.equal(models.get('unlisted-model')[0], '未定价');
+    assert.match(table.tFoot.rows[0].cells[1].textContent, /\$1,856\.33.*未定价/s);
+    assert.deepEqual([...table.tFoot.rows[0].cells].slice(2).map(cell => cell.textContent), ['$26.25', '—', '$33.75']);
+    assert.equal(table.querySelector('gpt-small'), null);
+});
+
+test('four period headers share the numeric column alignment even with missing cycles and price notes', async t =>
+{
+    const { root, dom } = await setup(t, async () => ({ status: 'ok', snapshot: reportWithHistory() }));
+    selectRange(root, dom, 'weekly');
+    const table = root.querySelector('[data-weekly-comparison] table');
+    const style = element => dom.window.getComputedStyle(element);
+    const headers = [...table.tHead.rows[0].cells].slice(1);
+    const amounts = table.tBodies[0].rows[0].cells;
+    const totals = table.tFoot.rows[0].cells;
+    assert.equal(style(table).tableLayout, 'fixed');
+    assert.equal(style(amounts[0]).textAlign, 'left');
+    for (const [i, header] of headers.entries())
+    {
+        const amount = amounts[i + 1];
+        assert.equal(style(header).width, style(headers[0]).width);
+        assert.equal(style(header.firstElementChild).paddingRight, style(amount).paddingRight);
+        for (const cell of [header, amount, totals[i + 1]])
+        {
+            assert.equal(style(cell).textAlign, 'right');
+            assert.equal(style(cell).verticalAlign, 'top');
+        }
+    }
+});
+
+test('weekly column buttons drill down into the cached cycle and restore focus on return', async t =>
+{
+    let queries = 0;
+    const { root, dom } = await setup(t, async () =>
+    {
+        queries++;
+        return { status: 'ok', snapshot: reportWithHistory() };
+    });
+    selectRange(root, dom, 'weekly');
+    const comparison = root.querySelector('[data-weekly-comparison]');
+    const previous = comparison.querySelector('button[data-weekly-cycle="1"]');
+    assert.equal(previous.tabIndex, 0);
+    previous.focus();
+    previous.click();
+
+    const detail = root.querySelector('[data-weekly-detail]');
+    const back = detail.querySelector('button[data-weekly-back]');
+    assert.equal(dom.window.document.activeElement, back);
+    assert.equal(comparison.hidden, true);
+    assert.equal(detail.hidden, false);
+    assert.match(detail.querySelector('[data-weekly-period]').textContent, /11\/05 00:30.*11\/12 00:29.*北京时间/);
+    assert.equal(detail.querySelector('[data-weekly-summary="usd"]').textContent, '$26.25');
+    assert.equal(detail.querySelector('[data-weekly-summary="requests"]').textContent, '3');
+    assert.match(detail.querySelector('tbody').textContent, /historical-model.*\$12\.75/s);
+    assert.doesNotMatch(detail.querySelector('tbody').textContent, /unlisted-model/);
+    back.click();
+    assert.equal(comparison.hidden, false);
+    assert.equal(detail.hidden, true);
+    assert.equal(dom.window.document.activeElement, comparison.querySelector('button[data-weekly-cycle="1"]'));
+    assert.equal(queries, 1);
+});
+
+test('weekly selection resets on refresh and on a switch to a legacy host', async t =>
+{
+    let finishRefresh;
+    let localQueries = 0;
+    const report = reportWithHistory();
+    const { root, dom } = await setup(t, async hostId =>
+    {
+        if (hostId !== 'local') return { status: 'stale', snapshot: { ...snapshot(), schemaVersion: 2,
+            generatedAt: Date.parse('2026-11-15T14:00:00Z'), weekly: { ...completedWeek(), rows: [] } } };
+        if (++localQueries === 1) return { status: 'ok', snapshot: report };
+        return await new Promise(resolve => { finishRefresh = resolve; });
+    });
+    selectRange(root, dom, 'weekly');
+    const comparison = root.querySelector('[data-weekly-comparison]');
+    const detail = root.querySelector('[data-weekly-detail]');
+    comparison.querySelector('button[data-weekly-cycle="1"]').click();
+    root.querySelector('[data-refresh]').click();
+    assert.equal(comparison.hidden, false);
+    assert.equal(detail.hidden, true);
+    assert.match(comparison.textContent, /上次数据截至/);
+
+    comparison.querySelector('button[data-weekly-cycle="1"]').click();
+    finishRefresh({ status: 'ok', snapshot: { ...report, weeklyHistory: [null, ...report.weeklyHistory.slice(1)] } });
+    await tick();
+    assert.equal(comparison.hidden, false);
+    assert.equal(detail.hidden, true);
+    assert.equal(comparison.querySelector('button[data-weekly-cycle="1"]'), null);
+
+    comparison.querySelector('button[data-weekly-cycle="3"]').click();
+    const host = root.querySelector('[aria-label="统计机器"]');
+    host.value = 'remote-1';
+    host.dispatchEvent(new dom.window.Event('change'));
+    await tick();
+    assert.equal(comparison.hidden, true);
+    assert.equal(detail.hidden, false);
+    assert.ok(detail.querySelector('[data-weekly-back]').hidden);
+    const currentOnly = detail.querySelector('[data-weekly-current-only]');
+    assert.equal(currentOnly.hidden, false);
+    assert.match(currentOnly.textContent, /仅提供本轮明细/);
+    assert.match(detail.textContent, /远程一.*请求数/s);
+    assert.match(detail.textContent, /缓存截至/);
+    assert.doesNotMatch(detail.textContent, /historical-model|10\/22/);
+});
+
+test('weekly cache and pricing notices preserve known zero costs in comparison and detail', async t =>
+{
+    const report = reportWithHistory();
+    report.weekly = { ...report.weekly, rows: [] };
+    report.coverage.cacheErrors = 1;
+    report.coverage.warnings = [
+        '用量缓存写入失败，仍显示已读取的统计。',
+        '1 次请求有未定价部分；美元仅含可定价用量。'
+    ];
+    const { root, dom } = await setup(t, async () => ({ status: 'ok', snapshot: report }));
+    selectRange(root, dom, 'weekly');
+
+    const comparison = root.querySelector('[data-weekly-comparison]');
+    assert.match(comparison.querySelector('[data-weekly-comparison-coverage]').textContent, /缓存写入失败.*未定价部分/);
+    assert.equal(comparison.querySelector('tfoot td').textContent, '$0.00');
+    assert.equal(comparison.querySelector('tbody td').textContent, '$0.00');
+    const current = comparison.querySelector('button[data-weekly-cycle="0"]');
+    assert.doesNotMatch(current.textContent, /部分覆盖/);
+    current.click();
+
+    const detail = root.querySelector('[data-weekly-detail]');
+    assert.equal(detail.querySelector('[data-weekly-summary="usd"]').textContent, '$0.00');
+    assert.match(detail.querySelector('[data-weekly-coverage]').textContent, /缓存写入失败.*未定价部分/);
+    assert.doesNotMatch(detail.querySelector('[data-weekly-empty]').textContent, /覆盖缺口/);
+});
+
+test('cached remote comparison keeps all four dated cycles and withholds zero for logging gaps', async t =>
+{
+    const report = reportWithHistory();
+    const oldest = report.weeklyHistory[2];
+    report.weeklyHistory[2] = { ...oldest, partial: false, rows: [] };
+    report.weeklyHistory[1] = { ...oldest, partial: false,
+        startAt: Date.parse('2026-10-28T16:30:00Z'), endAt: Date.parse('2026-11-04T16:29:59Z'),
+        fullAt: Date.parse('2026-11-04T01:00:00Z'), sampleAt: Date.parse('2026-11-04T02:00:00Z'), usedPercent: 100 };
+    report.coverage.conflictingRequests = 1;
+    report.coverage.warnings = ['重复响应的用量或模型冲突。'];
+    const { root, dom } = await setup(t, async hostId => hostId === 'local' ? { status: 'ok', snapshot: snapshot() }
+        : { status: 'stale', snapshot: report });
+    selectRange(root, dom, 'weekly');
+    const host = root.querySelector('[aria-label="统计机器"]');
+    host.value = 'remote-1';
+    host.dispatchEvent(new dom.window.Event('change'));
+    await tick();
+
+    const comparison = root.querySelector('[data-weekly-comparison]');
+    const buttons = [...comparison.querySelectorAll('thead button')];
+    assert.deepEqual(buttons.map(button => button.querySelector('time').dateTime),
+        ['2026-11-12', '2026-11-05', '2026-10-29', '2026-10-22']);
+    assert.match(comparison.textContent, /缓存截至.*11\/16 20:00/s);
+    assert.match(comparison.textContent, /重复响应的用量或模型冲突/);
+    assert.doesNotMatch(comparison.textContent, /\$0\.00/);
+    assert.match(buttons[3].textContent, /部分覆盖/);
+    assert.equal(comparison.querySelector('tfoot td:last-child').textContent, '—');
+
+    buttons[2].click();
+    const detail = root.querySelector('[data-weekly-detail]');
+    assert.match(detail.querySelector('[data-weekly-period]').textContent, /上两轮.*首次满额.*11\/04 09:00/);
+    assert.match(detail.querySelector('[data-weekly-updated]').textContent, /11\/05 00:29.*缓存截至.*11\/16 20:00/);
+    assert.match(detail.querySelector('[data-weekly-host]').textContent, /远程一请求数/);
+    assert.ok(detail.querySelector('table[aria-label="上两轮周额度模型用量"]'));
+});
+
+test('weekly comparison can show available history with no current observation or dated placeholders', async t =>
+{
+    const history = reportWithHistory().weeklyHistory;
+    const report = { ...snapshot(), schemaVersion: 3, weekly: null, weeklyHistory: [null, null, history[2]] };
+    const { root, dom } = await setup(t, async () => ({ status: 'ok', snapshot: report }));
+    selectRange(root, dom, 'weekly');
+    const comparison = root.querySelector('[data-weekly-comparison]');
+    const headers = comparison.querySelectorAll('thead th');
+    assert.equal(headers.length, 5);
+    for (const header of [...headers].slice(1, 4))
+    {
+        assert.match(header.textContent, /无记录/);
+        assert.doesNotMatch(header.textContent, /\d{2}\/\d{2}/);
+    }
+    assert.match(headers[4].querySelector('button').textContent, /10\/22 起/);
+});
+
 test('weekly quota displays the reset-to-full window with model costs sorted by long-context estimate', async t =>
 {
     const report = { ...snapshot(), weekly: completedWeek() };

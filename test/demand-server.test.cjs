@@ -102,20 +102,23 @@ test('new runners return a weekly snapshot only when the requester supports it',
     const { paths, calls } = await setup(t);
     const legacyCaps = JSON.parse(await fs.readFile(paths.capabilities, 'utf8'));
     assert.deepEqual(JSON.parse(await fs.readFile(paths.capabilitiesV2, 'utf8')), legacyCaps);
+    assert.deepEqual(JSON.parse(await fs.readFile(paths.capabilitiesV3, 'utf8')), legacyCaps);
     const now = Date.now();
     const weekly = { startAt: now - 1000, startKind: 'observed', fullAt: null,
         sampleAt: now, usedPercent: 42, rows: [] };
-    const local = { ...report(), generatedAt: now, schemaVersion: 2, weekly };
-    for (const snapshotVersion of [1, 2])
+    const previous = { ...weekly, startAt: now - 5000, sampleAt: now - 2500, endAt: now - 2000, partial: true };
+    const local = { ...report(), generatedAt: now, schemaVersion: 3, weekly, weeklyHistory: [previous] };
+    for (const snapshotVersion of [1, 2, 3])
     {
         const marker = makeMarker(randomUUID(), Date.now());
-        if (snapshotVersion === 2) marker.snapshotVersion = 2;
+        if (snapshotVersion > 1) marker.snapshotVersion = snapshotVersion;
         await write(paths, marker);
         await waitFor(() => Promise.resolve(calls.length), count => count === snapshotVersion);
         calls.at(-1).resolve({ status: 'ok', snapshot: local });
         const result = await waitFor(() => response(paths, marker.requestId), value => value.status === 'ok');
         assert.equal(result.snapshot.schemaVersion, snapshotVersion);
-        assert.deepEqual(result.snapshot.weekly, snapshotVersion === 2 ? weekly : undefined);
+        assert.deepEqual(result.snapshot.weekly, snapshotVersion >= 2 ? weekly : undefined);
+        assert.deepEqual(result.snapshot.weeklyHistory, snapshotVersion === 3 ? [previous] : undefined);
     }
     assert.deepEqual(local.weekly, weekly);
 });
