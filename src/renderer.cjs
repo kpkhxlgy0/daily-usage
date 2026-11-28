@@ -400,7 +400,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
         <div class="daily-usage-card"><small>请求数</small><strong data-summary="requests">—</strong></div>
     </div><p data-updated></p><p data-coverage></p>
     <div class="daily-usage-scroll"><table aria-label="每日模型用量"><thead><tr>
-    <th>日期</th><th>模型</th><th>请求</th><th>普通输入</th><th>缓存输入</th><th>缓存写入</th><th>输出</th><th>${AmountLabel}</th>
+    <th>日期</th><th>模型</th><th>请求</th><th>普通输入</th><th>缓存输入</th><th>缓存写入</th><th>输出</th><th title="${AmountLabel}">金额</th>
     </tr></thead><tbody></tbody></table></div>
     <p data-empty></p><p>机器列表包含本机和本窗口打开过的远程会话。远程机器需要安装并启用 Daily Usage。</p>
     </div>
@@ -438,7 +438,7 @@ function mountPanel(root, { getHosts, getReport, cancelReport = () => {}, now = 
                 <table aria-label="本轮周额度模型用量">
                     <caption>按模型统计</caption><thead><tr>
                     <th scope="col">模型</th><th scope="col">请求数</th>
-                    <th scope="col" aria-sort="descending">${AmountLabel}</th><th scope="col">金额占比</th>
+                    <th scope="col" aria-sort="descending" title="${AmountLabel}">金额</th><th scope="col">金额占比</th>
                 </tr></thead><tbody></tbody></table>
             </div>
             <p data-weekly-updated></p><p data-weekly-coverage></p>

@@ -363,7 +363,9 @@ test('weekly detail shows full-cycle model costs and both sides of the first obs
     assert.match(detail.querySelector('[data-weekly-split]').textContent,
         /首次观测满额.*11\/15 20:00.*截至首次观测的 100%.*16 次.*\$1,755\.33.*首次观测的 100% 之后.*4 次.*\$101\.005/s);
     assert.doesNotMatch(detail.querySelector('[data-weekly-split]').textContent, /余额|已扣|已支付/);
-    assert.match(table.tHead.textContent, /Standard API 等价金额（USD）/);
+    const amountHeader = table.tHead.querySelector('[aria-sort="descending"]');
+    assert.equal(amountHeader.textContent, '金额');
+    assert.equal(amountHeader.title, 'Standard API 等价金额（USD）');
     assert.doesNotMatch(table.tHead.textContent, /基础价|含长上下文/);
     assert.match(weekly.querySelector('[data-weekly-summary="usd"]').textContent, /^\$1,856\.335(?:（|$)/);
     assert.equal(weekly.querySelector('[data-weekly-summary="requests"]').textContent, '20');
@@ -486,7 +488,9 @@ test('filters calendar dates and exposes unpriced requests instead of showing th
     const { root, dom } = await setup(t);
     assert.equal(root.querySelectorAll('tbody tr').length, 1);
     assert.equal(root.querySelector('[data-summary="usd"]').previousElementSibling.textContent, 'Standard API 等价金额（USD）');
-    assert.equal(root.querySelector('thead th:last-child').textContent, 'Standard API 等价金额（USD）');
+    const amountHeader = root.querySelector('[data-calendar] thead th:last-child');
+    assert.equal(amountHeader.textContent, '金额');
+    assert.equal(amountHeader.title, 'Standard API 等价金额（USD）');
     assert.match(root.querySelector('[data-summary="usd"]').textContent, /1\.25/);
     const range = root.querySelector('[aria-label="统计时间范围"]');
     range.value = '7'; range.dispatchEvent(new dom.window.Event('change'));
